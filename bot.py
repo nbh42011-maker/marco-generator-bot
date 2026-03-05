@@ -1,10 +1,9 @@
-# bot.py — Complete generator bot
-# - Fixed /addstock (items field or .txt file)
-# - Autocomplete for stock_type (F -> Free)
-# - Category autocomplete
+# bot.py — Final production-ready generator bot
+# - /addstock fixed (items text or .txt)
+# - Autocomplete for stock_type and category
+# - Auto-delete plain messages in specified channels (keeps webhooks/apps/commands)
 # - Invite tracker (5 invites => role)
-# - Auto-delete plain messages in two channels (keeps commands/webhooks/apps)
-# - Tasks started in on_ready() to avoid "no running event loop" crash
+# - Tasks start in on_ready to avoid event loop crash
 
 import os
 import json
@@ -25,10 +24,10 @@ ADMIN_ROLE_ID = 1452719764119093388
 STAFF_NOTIFY_USER_ID = 884084052854984726
 RESTOCK_CHANNEL_ID = 1478792670049599618
 
-# Channels where plain messages should be auto-deleted (no response)
+# Channels where plain user messages should be auto-deleted (no response)
 AUTODELETE_CHANNELS = {1478790217971273788, 1454503001363583019}
 
-# Invite role (defaults to free gen role; change if you want different)
+# Invite role (default to FREE_GEN_ROLE_ID; change if desired)
 INVITE_ROLE_ID = FREE_GEN_ROLE_ID
 
 STOCK_FILE = "stock.json"
@@ -128,7 +127,7 @@ def format_stock_embed():
 def parse_items_from_text(text: str) -> List[str]:
     """
     Converts text -> list of items.
-    - If newlines exist -> split by newline.
+    - If newlines exist -> split by newline (preferred).
     - Else if commas exist -> split by comma.
     - Else -> single item.
     Preserves ':' inside items (e.g. email:pass).
@@ -148,7 +147,7 @@ def parse_items_from_text(text: str) -> List[str]:
 invites_cache: Dict[int, List[discord.Invite]] = {}
 invite_tracker: Dict[int, Dict[int, int]] = {}  # guild_id -> {inviter_id: count}
 
-# ---------------- background loops (start in on_ready) ----------------
+# ---------------- background loops (defined, started in on_ready) ----------------
 @tasks.loop(minutes=5)
 async def boost_loop():
     guild = bot.get_guild(GUILD_ID)
@@ -594,7 +593,7 @@ async def on_ready():
 
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
 
-    # start background loop(s) only when ready
+    # start background loops safely (only when ready)
     if not boost_loop.is_running():
         boost_loop.start()
 
@@ -612,32 +611,34 @@ async def on_ready():
 async def on_message(message: discord.Message):
     # allow bots, webhooks, apps, commands to pass
     if message.author.bot:
+        await bot.process_commands(message)  # still allow commands if bot authored (safety)
         return
 
     # don't delete messages from webhooks
     if message.webhook_id is not None:
+        await bot.process_commands(message)
         return
 
     # Do not delete application/command messages (they have different message types)
     if message.type != discord.MessageType.default:
+        await bot.process_commands(message)
         return
 
     # If the message starts with '/' assume user is invoking a slash command (do not delete)
     if message.content and message.content.startswith("/"):
+        await bot.process_commands(message)
         return
 
     # Only auto-delete in the defined channels
     if message.channel.id in AUTODELETE_CHANNELS:
         try:
-            # Do not delete if the message is an app message or from an integration
-            if message.author.system:
-                return
-            # Delete silently
+            # Delete silently (do not respond)
             await message.delete()
         except Exception:
             pass
+        return
 
-    # let other handlers run (prefix commands)
+    # allow normal processing for other messages
     await bot.process_commands(message)
 
 # ---------------- RUN ----------------
