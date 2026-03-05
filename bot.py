@@ -587,18 +587,15 @@ async def on_ready():
         boost_loop.start()
 
     # CLEAR old guild commands then sync the new ones (this fixes signature mismatches)
-    try:
-        guild_obj = discord.Object(id=GUILD_ID)
+    guild_obj = discord.Object(id=GUILD_ID)
 
-if CLEAR_OLD_COMMANDS:
+try:
     print("⚠️ Clearing old guild commands...")
-    await tree.sync(guild=guild_obj)
     await tree.clear_commands(guild=guild_obj)
-    await tree.sync(guild=guild_obj)
-    print("✅ Old commands cleared and new ones synced.")
-else:
     synced = await tree.sync(guild=guild_obj)
-    print(f"✅ Commands synced ({len(synced)})")
+    print(f"✅ Commands reset and synced ({len(synced)} commands)")
+except Exception as e:
+    print(f"[SYNC ERROR] {e}")
 
     # Optional extra one-time automatic sync (disabled by default); keep OFF once working to avoid rate-limits.
     if SYNC_ON_START:
