@@ -36,7 +36,7 @@ FREE_COOLDOWN = 180
 EXCL_COOLDOWN = 60
 RESYNC_COOLDOWN = 60 * 60  # 1 hour between manual resyncs
 
-# Optional: if set to "1" the bot will attempt a one-time guild sync on_ready
+# Optional: if set to "1" the bot will attempt a one-time global sync on_ready (keep OFF normally)
 SYNC_ON_START = os.getenv("SYNC_ON_START", "0") == "1"
 
 # ---------------- INTENTS & BOT ----------------
