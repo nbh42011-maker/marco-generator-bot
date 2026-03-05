@@ -145,13 +145,21 @@ def parse_items_from_text(text: str) -> List[str]:
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=PRESENCE_TEXT))
-    boost_loop.start()
-    # helpful debug
+
+    guild = discord.Object(id=GUILD_ID)
+
     try:
-        print("Guilds:", [g.id for g in bot.guilds])
-    except Exception:
-        pass
+        synced = await bot.tree.sync(guild=guild)
+        print(f"✅ Synced {len(synced)} commands to guild")
+    except Exception as e:
+        print("Sync error:", e)
+
+    await bot.change_presence(activity=discord.Activity(
+        type=discord.ActivityType.watching,
+        name=PRESENCE_TEXT
+    ))
+
+    boost_loop.start()
 
 # ---------------- global app command error ----------------
 @bot.tree.error
