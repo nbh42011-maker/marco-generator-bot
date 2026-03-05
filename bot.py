@@ -1,9 +1,4 @@
-# bot.py — Final full working generator bot
-# - Use environment variable TOKEN for the bot token
-# - Place this file in your repo and deploy (Railway / other)
-# - Make sure requirements.txt contains: discord.py, aiohttp
-# - After first deploy you can remove or set SYNC_ON_START=0 to avoid repeated syncs.
-
+# bot.py — Final full working generator bot (with forced guild clear+sync to fix mismatches)
 import os
 import json
 import time
@@ -35,6 +30,10 @@ STOCK_FILE = "stock.json"
 FREE_COOLDOWN = 180
 EXCL_COOLDOWN = 60
 RESYNC_COOLDOWN = 60 * 60  # 1 hour between manual resyncs
+
+# Set to True to CLEAR guild commands on startup then sync (use to fix CommandSignatureMismatch).
+# After you confirm commands are working, set this to False to avoid clearing on every restart.
+CLEAR_COMMANDS_ON_START = True
 
 # Optional: if set to "1" the bot will attempt a one-time global sync on_ready (keep OFF normally)
 SYNC_ON_START = os.getenv("SYNC_ON_START", "0") == "1"
@@ -129,13 +128,6 @@ def format_stock_embed():
 
 # ---------------- parsing helper (preserves ':') ----------------
 def parse_items_from_text(text: str) -> List[str]:
-    """
-    Parse input text into list of items.
-    - If text contains newlines -> split on newlines (preferred)
-    - Else if contains commas -> split on commas
-    - Else -> single item
-    Keeps ':' characters intact.
-    """
     if not text:
         return []
     text = text.strip()
@@ -215,7 +207,6 @@ class GenSelect(discord.ui.Select):
                  f"Here is your item for now:\n```{item}```"),
                 ephemeral=True
             )
-        # staff log (best-effort)
         try:
             staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
             await staff.send(f"[Generate] {interaction.user} ({interaction.user.id}) got item from {cat} ({self.typ})")
@@ -292,9 +283,6 @@ async def cmd_addstock(
     items: Optional[str] = None,
     file: Optional[discord.Attachment] = None
 ):
-    """
-    Use 'items' (paste multi-line or comma-separated list) OR attach a .txt file.
-    """
     await interaction.response.defer(ephemeral=True)
     t = stock_type.lower()
     if t not in ("free", "exclusive"):
@@ -331,7 +319,6 @@ async def cmd_addstock(
     await safe_save_stock()
     await interaction.followup.send(f"✅ Added {len(new_items)} item(s) to `{category}`.", ephemeral=True)
 
-    # Ping restock channel (best-effort)
     restock_channel = bot.get_channel(RESTOCK_CHANNEL_ID) or (interaction.guild.get_channel(RESTOCK_CHANNEL_ID) if interaction.guild else None)
     role_id = FREE_GEN_ROLE_ID if key == "FREE" else EXCLUSIVE_ROLE_ID
     if restock_channel:
@@ -503,7 +490,6 @@ async def cmd_resync(interaction: discord.Interaction):
 # ---------------- global app command error handler ----------------
 @bot.tree.error
 async def global_appcmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    # Handle common app command errors gracefully
     if isinstance(error, app_commands.MissingRole) or isinstance(error, app_commands.CheckFailure):
         try:
             if not interaction.response.is_done():
@@ -518,7 +504,6 @@ async def global_appcmd_error(interaction: discord.Interaction, error: app_comma
         except Exception:
             pass
         return
-    # fallback: notify staff and user
     print(f"[AppCommandError] {error!r}")
     try:
         if not interaction.response.is_done():
@@ -556,7 +541,6 @@ async def on_member_join(member: discord.Member):
         invite_tracker[guild.id].setdefault(inviter.id, 0)
         invite_tracker[guild.id][inviter.id] += 1
 
-        # Grant role at 5 invites
         if invite_tracker[guild.id][inviter.id] >= 5:
             role = guild.get_role(INVITE_ROLE_ID)
             user = guild.get_member(inviter.id)
@@ -601,10 +585,15 @@ async def on_ready():
     if not boost_loop.is_running():
         boost_loop.start()
 
-    # Force a guild-only sync to eliminate command signature mismatches (best practice)
-    # This sync is scoped to the configured GUILD_ID to avoid global rate limits.
+    # CLEAR old guild commands then sync the new ones (this fixes signature mismatches)
     try:
         guild_obj = discord.Object(id=GUILD_ID)
+        if CLEAR_COMMANDS_ON_START:
+            try:
+                bot.tree.clear_commands(guild=guild_obj)
+                print("Cleared existing guild commands (guild-scoped).")
+            except Exception as e:
+                print(f"[CLEAR ERROR] {e}")
         synced = await tree.sync(guild=guild_obj)
         print(f"✅ Commands synced to guild ({len(synced)} commands).")
     except Exception as e:
