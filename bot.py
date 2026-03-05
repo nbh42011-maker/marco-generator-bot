@@ -601,6 +601,14 @@ async def on_ready():
     if not boost_loop.is_running():
         boost_loop.start()
 
+        # ---------------- FIX: CLEAR OLD COMMANDS ----------------
+    # This prevents CommandSignatureMismatch errors on first deploy
+    try:
+        guild_obj = discord.Object(id=GUILD_ID)
+        await tree.clear_commands(guild=guild_obj)  # <<< must be inside async function
+        print("✅ Cleared old guild commands")
+    except Exception as e:
+        print(f"[CLEAR ERROR] {e}")
     # Force a guild-only sync to eliminate command signature mismatches (best practice)
     # This sync is scoped to the configured GUILD_ID to avoid global rate limits.
     try:
