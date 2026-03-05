@@ -46,6 +46,7 @@ intents.presences = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 tree = bot.tree
+CLEAR_OLD_COMMANDS = True
 
 # ---------------- storage & lock ----------------
 _file_lock = asyncio.Lock()
@@ -588,16 +589,16 @@ async def on_ready():
     # CLEAR old guild commands then sync the new ones (this fixes signature mismatches)
     try:
         guild_obj = discord.Object(id=GUILD_ID)
-        if CLEAR_COMMANDS_ON_START:
-            try:
-                bot.tree.clear_commands(guild=guild_obj)
-                print("Cleared existing guild commands (guild-scoped).")
-            except Exception as e:
-                print(f"[CLEAR ERROR] {e}")
-        synced = await tree.sync(guild=guild_obj)
-        print(f"✅ Commands synced to guild ({len(synced)} commands).")
-    except Exception as e:
-        print(f"[SYNC ERROR] {e}")
+
+if CLEAR_OLD_COMMANDS:
+    print("⚠️ Clearing old guild commands...")
+    await tree.sync(guild=guild_obj)
+    await tree.clear_commands(guild=guild_obj)
+    await tree.sync(guild=guild_obj)
+    print("✅ Old commands cleared and new ones synced.")
+else:
+    synced = await tree.sync(guild=guild_obj)
+    print(f"✅ Commands synced ({len(synced)})")
 
     # Optional extra one-time automatic sync (disabled by default); keep OFF once working to avoid rate-limits.
     if SYNC_ON_START:
