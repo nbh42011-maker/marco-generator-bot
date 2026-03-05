@@ -1,13 +1,19 @@
-# bot.py — Full generator bot (no custom-status requirement, robust addstock, invite tracker)
+# bot.py — Full working generator bot
+# - No /verify command
+# - /invites shows invite progress
+# - Robust /addstock (text OR .txt; preserves ':' inside items)
+# - Invite tracker (5 invites -> role)
+# - Tasks start safely inside on_ready()
+
 import os
 import json
 import time
 import asyncio
-import datetime
+from typing import Optional, List, Dict
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from typing import Optional, List, Dict
 
 # ---------------- CONFIG (change IDs if needed) ----------------
 GUILD_ID = 1452717489656954961
@@ -18,16 +24,17 @@ ADMIN_ROLE_ID = 1452719764119093388
 STAFF_NOTIFY_USER_ID = 884084052854984726
 RESTOCK_CHANNEL_ID = 1478792670049599618
 
-# Invite role: change if you want a different role after 5 invites
-INVITE_ROLE_ID = FREE_GEN_ROLE_ID  # replace if needed
+# Invite role: default to FREE_GEN_ROLE_ID (change to specific if desired)
+INVITE_ROLE_ID = FREE_GEN_ROLE_ID
 
 STOCK_FILE = "stock.json"
 
-FREE_COOLDOWN = 180   # seconds (3 minutes)
-EXCL_COOLDOWN = 60    # seconds (1 minute)
-RESYNC_COOLDOWN = 60 * 60  # 1 hour between manual resyncs
+# cooldowns (seconds)
+FREE_COOLDOWN = 180
+EXCL_COOLDOWN = 60
+RESYNC_COOLDOWN = 60 * 60  # 1 hour
 
-# ---------------- BOT / INTENTS ----------------
+# ---------------- INTENTS & BOT ----------------
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
@@ -65,8 +72,8 @@ async def safe_save_stock():
     async with _file_lock:
         _save_stock_to_disk(stock_data)
 
-# ---------------- cooldowns/resync guard ----------------
-_cooldowns: Dict = {}  # {(user_id, "FREE"|"EXCLUSIVE"): timestamp}
+# ---------------- cooldowns / resync ----------------
+_cooldowns: Dict = {}
 _last_resync_ts = 0
 
 def now_ts() -> float:
@@ -82,16 +89,14 @@ def check_cooldown(user_id: int, typ: str) -> int:
 def set_cooldown(user_id: int, typ: str):
     _cooldowns[(user_id, typ)] = now_ts()
 
-# ---------------- admin check helper ----------------
+# ---------------- admin-check decorator ----------------
 def is_admin_check():
     async def predicate(interaction: discord.Interaction) -> bool:
         user = interaction.user
-        if not hasattr(user, "roles"):
-            return False
         return any(r.id == ADMIN_ROLE_ID for r in getattr(user, "roles", []))
     return app_commands.check(predicate)
 
-# ---------------- autocomplete ----------------
+# ---------------- autocompletes ----------------
 async def category_autocomplete(interaction: discord.Interaction, current: str):
     await safe_load_stock()
     cats = stock_data.get("categories", [])
@@ -115,14 +120,14 @@ def format_stock_embed():
     embed.set_footer(text="Automated • Marcos Gen")
     return embed
 
-# ---------------- parse helper (preserves ':' inside items) ----------------
+# ---------------- parsing helper ----------------
 def parse_items_from_text(text: str) -> List[str]:
     """
-    Parse input text into item strings.
-    - If input contains newlines -> split by newline.
-    - Else if contains commas -> split by comma.
+    Converts text -> list of items.
+    - If newlines exist -> split by newline (preferred).
+    - Else if commas exist -> split by comma.
     - Else -> single item.
-    Keeps ':' inside items intact.
+    Preserves ':' inside items (e.g. email:pass).
     """
     if not text:
         return []
@@ -135,116 +140,11 @@ def parse_items_from_text(text: str) -> List[str]:
         lines = [text]
     return lines
 
-# ---------------- INVITE TRACKER ----------------
+# ---------------- invite tracker ----------------
 invites_cache: Dict[int, List[discord.Invite]] = {}
-invite_tracker: Dict[int, Dict[int, int]] = {}  # {guild_id: {inviter_id: count}}
+invite_tracker: Dict[int, Dict[int, int]] = {}  # guild_id -> {inviter_id: count}
 
-# ---------------- STARTUP (guarded one-time sync optional) ----------------
-@bot.event
-async def on_ready():
-    # populate invites cache
-    for guild in bot.guilds:
-        try:
-            invites_cache[guild.id] = await guild.invites()
-        except Exception:
-            invites_cache[guild.id] = []
-    print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
-
-    # Optional: one-time guarded sync from env var to register commands to your guild.
-    # Set SYNC_ON_START=1 in your Railway variables to run once, then remove it.
-    if os.getenv("SYNC_ON_START", "0") == "1":
-        try:
-            guild_obj = discord.Object(id=GUILD_ID)
-            synced = await tree.sync(guild=guild_obj)
-            print(f"✅ One-time sync complete — {len(synced)} commands synced to guild.")
-        except Exception as e:
-            print(f"[SYNC ERROR] {e}")
-
-# ---------------- INVITE EVENTS ----------------
-@bot.event
-async def on_member_join(member: discord.Member):
-    guild = member.guild
-    old_invites = invites_cache.get(guild.id, [])
-    try:
-        new_invites = await guild.invites()
-    except Exception:
-        invites_cache[guild.id] = old_invites
-        return
-
-    inviter = None
-    for invite in new_invites:
-        matched = next((old for old in old_invites if old.code == invite.code), None)
-        if matched and invite.uses > matched.uses:
-            inviter = invite.inviter
-            break
-
-    invites_cache[guild.id] = new_invites
-
-    if inviter:
-        invite_tracker.setdefault(guild.id, {})
-        invite_tracker[guild.id].setdefault(inviter.id, 0)
-        invite_tracker[guild.id][inviter.id] += 1
-
-        if invite_tracker[guild.id][inviter.id] >= 5:
-            role = guild.get_role(INVITE_ROLE_ID)
-            user = guild.get_member(inviter.id)
-            if role and user:
-                try:
-                    await user.add_roles(role)
-                except Exception:
-                    pass
-
-@bot.event
-async def on_member_remove(member: discord.Member):
-    guild = member.guild
-    trackers = invite_tracker.get(guild.id, {})
-    if not trackers:
-        return
-    # best-effort: decrement any inviter with count>0
-    for inviter_id in list(trackers.keys()):
-        if invite_tracker[guild.id].get(inviter_id, 0) > 0:
-            invite_tracker[guild.id][inviter_id] -= 1
-            if invite_tracker[guild.id][inviter_id] < 5:
-                role = guild.get_role(INVITE_ROLE_ID)
-                user = guild.get_member(inviter_id)
-                if role and user and role in user.roles:
-                    try:
-                        await user.remove_roles(role)
-                    except Exception:
-                        pass
-            break
-
-# ---------------- ERROR HANDLER ----------------
-@bot.tree.error
-async def global_appcmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingRole) or isinstance(error, app_commands.CheckFailure):
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
-        except Exception:
-            pass
-        return
-    if isinstance(error, app_commands.CommandNotFound):
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message("⚠️ That command isn't available. Ask an admin to run `/resync-commands`.", ephemeral=True)
-        except Exception:
-            pass
-        return
-    # fallback
-    print(f"[AppCommandError] {error!r}")
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("An unexpected error occurred. Staff has been notified.", ephemeral=True)
-    except Exception:
-        pass
-    try:
-        staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
-        await staff.send(f"[Error] User {interaction.user} triggered an error: {error!r}")
-    except Exception:
-        pass
-
-# ---------------- BOOST LOOP ----------------
+# ---------------- background loops (defined, started in on_ready) ----------------
 @tasks.loop(minutes=5)
 async def boost_loop():
     guild = bot.get_guild(GUILD_ID)
@@ -267,7 +167,7 @@ async def boost_loop():
         except Exception:
             continue
 
-# ---------------- GEN UI ----------------
+# ---------------- Gen UI ----------------
 class GenSelect(discord.ui.Select):
     def __init__(self, typ: str):
         opts = []
@@ -308,7 +208,7 @@ class GenSelect(discord.ui.Select):
                  f"Here is your item for now:\n```{item}```"),
                 ephemeral=True
             )
-        # staff log
+        # staff log (best-effort)
         try:
             staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
             await staff.send(f"[Generate] {interaction.user} ({interaction.user.id}) got item from {cat} ({self.typ})")
@@ -326,7 +226,7 @@ async def cmd_gen(interaction: discord.Interaction):
     await safe_load_stock()
     if not any(r.id == FREE_GEN_ROLE_ID for r in getattr(interaction.user, "roles", [])):
         await interaction.response.send_message(
-            ("❌ Free Gen access requires the FreeGen role. Run `/verify` or ask staff."),
+            ("❌ Free Gen access requires the FreeGen role. You can earn it by inviting friends — run `/invites` to see your progress."),
             ephemeral=True
         )
         return
@@ -407,7 +307,6 @@ async def cmd_addstock(
         return
 
     new_items: List[str] = []
-    # file preferred
     if file:
         try:
             raw = await file.read()
@@ -538,21 +437,32 @@ async def cmd_restock(
         except Exception:
             pass
 
-# ---------------- VERIFY (simple role grant) ----------------
-@tree.command(name="verify", description="Receive Free Gen role")
-async def cmd_verify(interaction: discord.Interaction):
+# ---------------- INVITES (replaces /verify) ----------------
+@tree.command(name="invites", description="See progress toward Free Gen role (5 invites required)")
+async def cmd_invites(interaction: discord.Interaction):
+    """
+    Reports the number of invites the user currently has according to our tracker.
+    This is a best-effort counter based on tracked invite uses while the bot was online.
+    """
     await interaction.response.defer(ephemeral=True)
-    member = interaction.user
-    role = interaction.guild.get_role(FREE_GEN_ROLE_ID) if interaction.guild else None
-    if not role:
-        await interaction.followup.send("⚠️ Free role not found on this server. Ask an admin to check configuration.", ephemeral=True)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("This command must be used in a server.", ephemeral=True)
         return
-    try:
-        if role not in member.roles:
-            await member.add_roles(role)
-        await interaction.followup.send("✅ You have been granted the Free Gen role.", ephemeral=True)
-    except Exception:
-        await interaction.followup.send("⚠️ Could not assign role. Ensure the bot has Manage Roles permission and its role is above the FreeGen role.", ephemeral=True)
+    inviter_id = interaction.user.id
+    count = invite_tracker.get(guild.id, {}).get(inviter_id, 0)
+    needed = max(0, 5 - count)
+    # Professional, engaging message
+    embed = discord.Embed(
+        title="🎯 Free Gen Invite Progress",
+        description=(f"Invite friends to earn the Free Gen role — it's quick and totally free!\n\n"
+                     f"**Your progress:** {count} invite(s)\n"
+                     f"**Remaining to earn role:** {needed}\n\n"
+                     "When you reach 5 invites you'll automatically receive the Free Gen role. Keep sharing the invite link!"),
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="Invites tracked while bot is online — counts are best-effort.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ---------------- REDEEM MODAL ----------------
 class RedeemModal(discord.ui.Modal, title="Redeem Exclusive Gift Card"):
@@ -575,7 +485,7 @@ class RedeemModal(discord.ui.Modal, title="Redeem Exclusive Gift Card"):
 async def cmd_redeem(interaction: discord.Interaction):
     await interaction.response.send_modal(RedeemModal())
 
-# ---------------- RESYNC (admin, rate-limited) ----------------
+# ---------------- RESYNC (admin, guarded) ----------------
 @tree.command(name="resync-commands", description="(Admin) Register/sync commands to the guild (use only if needed)")
 @is_admin_check()
 async def cmd_resync(interaction: discord.Interaction):
@@ -595,6 +505,114 @@ async def cmd_resync(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
 
+# ---------------- global app command error handler ----------------
+@bot.tree.error
+async def global_appcmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingRole) or isinstance(error, app_commands.CheckFailure):
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        except Exception:
+            pass
+        return
+    if isinstance(error, app_commands.CommandNotFound):
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("⚠️ That command isn't available. Ask an admin to run `/resync-commands`.", ephemeral=True)
+        except Exception:
+            pass
+        return
+    # fallback
+    print(f"[AppCommandError] {error!r}")
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("An unexpected error occurred. Staff has been notified.", ephemeral=True)
+    except Exception:
+        pass
+    try:
+        staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
+        await staff.send(f"[Error] User {interaction.user} triggered an error: {error!r}")
+    except Exception:
+        pass
+
+# ---------------- invite events ----------------
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+    old_invites = invites_cache.get(guild.id, [])
+    try:
+        new_invites = await guild.invites()
+    except Exception:
+        invites_cache[guild.id] = old_invites
+        return
+
+    inviter = None
+    for invite in new_invites:
+        matched = next((old for old in old_invites if old.code == invite.code), None)
+        if matched and invite.uses > matched.uses:
+            inviter = invite.inviter
+            break
+
+    invites_cache[guild.id] = new_invites
+
+    if inviter:
+        invite_tracker.setdefault(guild.id, {})
+        invite_tracker[guild.id].setdefault(inviter.id, 0)
+        invite_tracker[guild.id][inviter.id] += 1
+
+        # Grant role at 5 invites
+        if invite_tracker[guild.id][inviter.id] >= 5:
+            role = guild.get_role(INVITE_ROLE_ID)
+            user = guild.get_member(inviter.id)
+            if role and user:
+                try:
+                    await user.add_roles(role)
+                except Exception:
+                    pass
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    guild = member.guild
+    trackers = invite_tracker.get(guild.id, {})
+    if not trackers:
+        return
+    for inviter_id in list(trackers.keys()):
+        if invite_tracker[guild.id].get(inviter_id, 0) > 0:
+            invite_tracker[guild.id][inviter_id] -= 1
+            if invite_tracker[guild.id][inviter_id] < 5:
+                role = guild.get_role(INVITE_ROLE_ID)
+                user = guild.get_member(inviter_id)
+                if role and user and role in user.roles:
+                    try:
+                        await user.remove_roles(role)
+                    except Exception:
+                        pass
+            break
+
+# ---------------- on_ready (start tasks safely + populate invite cache) ----------------
+@bot.event
+async def on_ready():
+    # populate invites cache
+    for guild in bot.guilds:
+        try:
+            invites_cache[guild.id] = await guild.invites()
+        except Exception:
+            invites_cache[guild.id] = []
+    print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
+
+    # start background loops safely (only when ready)
+    if not boost_loop.is_running():
+        boost_loop.start()
+
+    # optional one-time auto-sync (enable SYNC_ON_START=1 in env for initial registration)
+    if os.getenv("SYNC_ON_START", "0") == "1":
+        try:
+            guild_obj = discord.Object(id=GUILD_ID)
+            synced = await tree.sync(guild=guild_obj)
+            print(f"✅ One-time sync complete — {len(synced)} commands synced to guild.")
+        except Exception as e:
+            print(f"[SYNC ERROR] {e}")
+
 # ---------------- RUN ----------------
 if __name__ == "__main__":
     TOKEN = os.getenv("TOKEN")
@@ -603,6 +621,4 @@ if __name__ == "__main__":
     else:
         _ensure_stock_file()
         stock_data = _load_stock_from_disk()
-        # start background loops after starting
-        boost_loop.start()
         bot.run(TOKEN)
