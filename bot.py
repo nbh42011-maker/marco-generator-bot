@@ -1,4 +1,4 @@
-# bot.py
+# bot.py  — full working generator bot
 import os
 import json
 import time
@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from typing import Optional, List
 
-# ---------------- CONFIG ----------------
+# ---------------- CONFIG (change only IDs if needed) ----------------
 GUILD_ID = 1452717489656954961
 FREE_GEN_ROLE_ID = 1467913996723032315
 EXCLUSIVE_ROLE_ID = 1453906576237924603
@@ -21,8 +21,8 @@ RESTOCK_CHANNEL_ID = 1478792670049599618
 STOCK_FILE = "stock.json"
 PRESENCE_TEXT = ".gg/nV3x85Jeq | BEST DROPS + GEN IN DISCORD"
 
-FREE_COOLDOWN = 180   # seconds
-EXCL_COOLDOWN = 60    # seconds
+FREE_COOLDOWN = 180   # seconds (3 minutes)
+EXCL_COOLDOWN = 60    # seconds (1 minute)
 RESYNC_COOLDOWN = 60 * 60  # 1 hour between manual resyncs
 
 # ---------------- BOT / INTENTS ----------------
@@ -39,19 +39,18 @@ _file_lock = asyncio.Lock()
 
 def _ensure_stock_file():
     if not os.path.exists(STOCK_FILE):
-        with open(STOCK_FILE, "w") as f:
+        with open(STOCK_FILE, "w", encoding="utf-8") as f:
             json.dump({"FREE": {}, "EXCLUSIVE": {}, "categories": []}, f, indent=4)
 
 def _load_stock_from_disk():
     _ensure_stock_file()
-    with open(STOCK_FILE, "r") as f:
+    with open(STOCK_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def _save_stock_to_disk(data):
-    with open(STOCK_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    with open(STOCK_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
-# in-memory cache
 stock_data = _load_stock_from_disk()
 
 async def safe_load_stock():
@@ -64,7 +63,7 @@ async def safe_save_stock():
     async with _file_lock:
         _save_stock_to_disk(stock_data)
 
-# ---------------- COOLDOWN / RESYNC ----------------
+# ---------------- cooldowns/resync guard ----------------
 _cooldowns = {}  # {(user_id, "FREE"|"EXCLUSIVE"): timestamp}
 _last_resync_ts = 0
 
@@ -72,6 +71,7 @@ def now_ts():
     return time.time()
 
 def check_cooldown(user_id: int, typ: str) -> int:
+    """Return remaining seconds (int) or 0 if not on cooldown."""
     key = (user_id, typ)
     last = _cooldowns.get(key, 0)
     limit = FREE_COOLDOWN if typ == "FREE" else EXCL_COOLDOWN
@@ -81,7 +81,7 @@ def check_cooldown(user_id: int, typ: str) -> int:
 def set_cooldown(user_id: int, typ: str):
     _cooldowns[(user_id, typ)] = now_ts()
 
-# ---------------- ADMIN CHECK DECORATOR ----------------
+# ---------------- admin check helper ----------------
 def is_admin_check():
     async def predicate(interaction: discord.Interaction) -> bool:
         user = interaction.user
@@ -90,17 +90,17 @@ def is_admin_check():
         return any(r.id == ADMIN_ROLE_ID for r in getattr(user, "roles", []))
     return app_commands.check(predicate)
 
-# ---------------- AUTOCOMPLETE ----------------
+# ---------------- autocomplete ----------------
 async def category_autocomplete(interaction: discord.Interaction, current: str):
     await safe_load_stock()
     cats = stock_data.get("categories", [])
     return [app_commands.Choice(name=c, value=c) for c in cats if current.lower() in c.lower()][:25]
 
 async def type_autocomplete(interaction: discord.Interaction, current: str):
-    options = ["free", "exclusive"]
-    return [app_commands.Choice(name=o.capitalize(), value=o) for o in options if current.lower() in o.lower()][:25]
+    opts = ["free", "exclusive"]
+    return [app_commands.Choice(name=o.capitalize(), value=o) for o in opts if current.lower() in o.lower()][:25]
 
-# ---------------- UTIL / FORMATTING ----------------
+# ---------------- util / formatting ----------------
 def format_stock_embed():
     d = stock_data
     embed = discord.Embed(title="📦 Marcos Gen • Stock Overview", color=discord.Color.blue())
@@ -115,29 +115,47 @@ def format_stock_embed():
     return embed
 
 def user_has_required_status(member: discord.Member) -> bool:
-    # best-effort; Discord custom status can be unreliable for bots
+    # best-effort; custom status detection can be unreliable, but try
     for act in getattr(member, "activities", []):
         if isinstance(act, discord.CustomActivity) and act.name:
             if PRESENCE_TEXT.lower() in act.name.lower():
                 return True
     return False
 
-# ---------------- STARTUP (no auto-sync) ----------------
+def parse_items_from_text(text: str) -> List[str]:
+    """Parse input text into item strings.
+       Accepts newline-separated or comma-separated lists.
+       Preserves ':' characters inside items (e.g., 123:abc)."""
+    if not text:
+        return []
+    # Normalize line endings
+    text = text.strip()
+    # If there are newlines, split by newlines
+    if "\n" in text:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+    elif "," in text:
+        # comma-separated on a single line
+        lines = [l.strip() for l in text.split(",") if l.strip()]
+    else:
+        # single item
+        lines = [text.strip()]
+    return lines
+
+# ---------------- startup (no auto sync to avoid rate limits) ----------------
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=PRESENCE_TEXT))
     boost_loop.start()
-    # do not auto sync on ready to avoid rate limits - use /resync-commands or one-time registrar
-    # but print existing guilds for debugging
+    # helpful debug
     try:
         print("Guilds:", [g.id for g in bot.guilds])
     except Exception:
         pass
 
-# ---------------- ERROR HANDLER ----------------
+# ---------------- global app command error ----------------
 @bot.tree.error
-async def global_appcmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingRole):
         try:
             if not interaction.response.is_done():
@@ -152,21 +170,20 @@ async def global_appcmd_error(interaction: discord.Interaction, error: app_comma
         except Exception:
             pass
         return
-    # generic
+    # fallback
     print(f"[AppCommandError] {error!r}")
     try:
         if not interaction.response.is_done():
             await interaction.response.send_message("An unexpected error occurred. Staff has been notified.", ephemeral=True)
     except Exception:
         pass
-    # notify staff (best-effort)
     try:
         staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
         await staff.send(f"[Error] User {interaction.user} triggered an error: {error!r}")
     except Exception:
         pass
 
-# ---------------- BOOST LOOP ----------------
+# ---------------- boost loop ----------------
 @tasks.loop(minutes=5)
 async def boost_loop():
     guild = bot.get_guild(GUILD_ID)
@@ -189,7 +206,7 @@ async def boost_loop():
         except Exception:
             continue
 
-# ---------------- GEN UI ----------------
+# ---------------- Gen UI ----------------
 class GenSelect(discord.ui.Select):
     def __init__(self, typ: str):
         opts = []
@@ -201,7 +218,6 @@ class GenSelect(discord.ui.Select):
         self.typ = typ
 
     async def callback(self, interaction: discord.Interaction):
-        # defer because we will do I/O and DM
         await interaction.response.defer(ephemeral=True)
         await safe_load_stock()
         cat = self.values[0]
@@ -226,13 +242,11 @@ class GenSelect(discord.ui.Select):
         if dm_ok:
             await interaction.followup.send("✅ Sent to your DMs.", ephemeral=True)
         else:
-            # fallback: show the item in ephemeral and instruct user
             await interaction.followup.send(
                 ("⚠️ Could not send DM. Please enable DMs from server members or accept direct messages.\n\n"
                  f"Here is your item for now:\n```{item}```"),
                 ephemeral=True
             )
-
         # staff log
         try:
             staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
@@ -248,15 +262,13 @@ class GenView(discord.ui.View):
 # ---------------- USER COMMANDS ----------------
 @tree.command(name="gen", description="Generate a Free item")
 async def cmd_gen(interaction: discord.Interaction):
-    # inform about /verify (custom status detection is unreliable)
     await safe_load_stock()
+    # if user doesn't have free role, ask them to /verify first
     if not any(r.id == FREE_GEN_ROLE_ID for r in getattr(interaction.user, "roles", [])):
-        # if they already have role, skip; otherwise prompt verify
         if user_has_required_status(interaction.user):
-            # encourage verify to get persistent role
             await interaction.response.send_message(
-                ("ℹ️ We detected your custom status. Run `/verify` to get the Free Gen role automatically in future.\n\n"
-                 "Selecting a category now will still work if you have the role."),
+                ("ℹ️ We detected your custom status. Run `/verify` to get Free Gen role for future access.\n\n"
+                 "If you'd like, staff can also grant you the role."),
                 ephemeral=True
             )
         else:
@@ -267,7 +279,6 @@ async def cmd_gen(interaction: discord.Interaction):
                 ephemeral=True
             )
             return
-
     await interaction.response.send_message("📦 Select a Free category:", view=GenView("FREE"), ephemeral=True)
 
 @tree.command(name="exclusive-gen", description="Generate an Exclusive item")
@@ -335,11 +346,11 @@ async def cmd_addstock(
         return
 
     new_items = []
-    # prefer file if provided
     if file:
         try:
             raw = await file.read()
-            lines = [l.strip() for l in raw.decode(errors="ignore").splitlines() if l.strip()]
+            text = raw.decode(errors="ignore")
+            lines = parse_items_from_text(text)
         except Exception:
             await interaction.followup.send("❌ Could not read attached file. Make sure it's a plain .txt file.", ephemeral=True)
             return
@@ -347,7 +358,7 @@ async def cmd_addstock(
             if line not in stock_data[key].get(category, []):
                 new_items.append(line)
     elif stock:
-        lines = [l.strip() for l in stock.splitlines() if l.strip()]
+        lines = parse_items_from_text(stock)
         for line in lines:
             if line not in stock_data[key].get(category, []):
                 new_items.append(line)
@@ -390,7 +401,8 @@ async def cmd_removestock(
     if file:
         try:
             raw = await file.read()
-            lines = [l.strip() for l in raw.decode(errors="ignore").splitlines() if l.strip()]
+            text = raw.decode(errors="ignore")
+            lines = parse_items_from_text(text)
         except Exception:
             await interaction.followup.send("❌ Could not read attached file. Use a plain .txt.", ephemeral=True)
             return
@@ -399,7 +411,7 @@ async def cmd_removestock(
                 stock_data[key][category].remove(line)
                 removed += 1
     elif stock:
-        lines = [l.strip() for l in stock.splitlines() if l.strip()]
+        lines = parse_items_from_text(stock)
         for line in lines:
             while line in stock_data[key].get(category, []):
                 stock_data[key][category].remove(line)
@@ -436,13 +448,14 @@ async def cmd_restock(
     if file:
         try:
             raw = await file.read()
-            lines = [l.strip() for l in raw.decode(errors="ignore").splitlines() if l.strip()]
+            text = raw.decode(errors="ignore")
+            lines = parse_items_from_text(text)
             new_items = list(dict.fromkeys(lines))
         except Exception:
             await interaction.followup.send("❌ Could not read attached file. Use a plain .txt.", ephemeral=True)
             return
     elif stock:
-        lines = [l.strip() for l in stock.splitlines() if l.strip()]
+        lines = parse_items_from_text(stock)
         new_items = list(dict.fromkeys(lines))
     else:
         await interaction.followup.send("❌ Provide stock text or attach a .txt file.", ephemeral=True)
@@ -483,7 +496,7 @@ async def cmd_verify(interaction: discord.Interaction):
                 await member.add_roles(role)
             await interaction.followup.send("✅ Verification successful — Free Gen role granted.", ephemeral=True)
         except Exception:
-            await interaction.followup.send("⚠️ Could not assign role. Ensure the bot has Manage Roles permission.", ephemeral=True)
+            await interaction.followup.send("⚠️ Could not assign role. Ensure the bot has Manage Roles permission and its role is above the FreeGen role.", ephemeral=True)
     else:
         await interaction.followup.send("⚠️ Free role not found on this server. Ask an admin to check configuration.", ephemeral=True)
 
@@ -536,5 +549,4 @@ if __name__ == "__main__":
     else:
         _ensure_stock_file()
         stock_data = _load_stock_from_disk()
-        # run bot
         bot.run(TOKEN)
