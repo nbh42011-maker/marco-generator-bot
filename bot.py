@@ -1,4 +1,4 @@
-# bot.py  — full working generator bot
+# bot.py — Full generator bot (no custom-status, fixed addstock, invite tracker)
 import os
 import json
 import time
@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from typing import Optional, List
 
-# ---------------- CONFIG (change only IDs if needed) ----------------
+# ---------------- CONFIG (change IDs if needed) ----------------
 GUILD_ID = 1452717489656954961
 FREE_GEN_ROLE_ID = 1467913996723032315
 EXCLUSIVE_ROLE_ID = 1453906576237924603
@@ -18,9 +18,10 @@ ADMIN_ROLE_ID = 1452719764119093388
 STAFF_NOTIFY_USER_ID = 884084052854984726
 RESTOCK_CHANNEL_ID = 1478792670049599618
 
-STOCK_FILE = "stock.json"
-PRESENCE_TEXT = ".gg/nV3x85Jeq | BEST DROPS + GEN IN DISCORD"
+# Invite role: change to another ID if you want a separate invite role.
+INVITE_ROLE_ID = FREE_GEN_ROLE_ID  # defaults to the FreeGen role
 
+STOCK_FILE = "stock.json"
 FREE_COOLDOWN = 180   # seconds (3 minutes)
 EXCL_COOLDOWN = 60    # seconds (1 minute)
 RESYNC_COOLDOWN = 60 * 60  # 1 hour between manual resyncs
@@ -71,7 +72,6 @@ def now_ts():
     return time.time()
 
 def check_cooldown(user_id: int, typ: str) -> int:
-    """Return remaining seconds (int) or 0 if not on cooldown."""
     key = (user_id, typ)
     last = _cooldowns.get(key, 0)
     limit = FREE_COOLDOWN if typ == "FREE" else EXCL_COOLDOWN
@@ -103,7 +103,7 @@ async def type_autocomplete(interaction: discord.Interaction, current: str):
 # ---------------- util / formatting ----------------
 def format_stock_embed():
     d = stock_data
-    embed = discord.Embed(title="📦 Marcos Gen • Stock Overview", color=discord.Color.blue())
+    embed = discord.Embed(title="📦 Stock Overview", color=discord.Color.blue())
     free_lines = []
     excl_lines = []
     for cat in d.get("categories", []):
@@ -111,60 +111,96 @@ def format_stock_embed():
         excl_lines.append(f"**{cat}** → {len(d.get('EXCLUSIVE', {}).get(cat, []))}")
     embed.add_field(name="🆓 Free Stock", value="\n".join(free_lines) or "No categories", inline=False)
     embed.add_field(name="💎 Exclusive Stock", value="\n".join(excl_lines) or "No categories", inline=False)
-    embed.set_footer(text="Professional • Secure • Automated")
+    embed.set_footer(text="Automated • Marcos Gen")
     return embed
 
-def user_has_required_status(member: discord.Member) -> bool:
-    # best-effort; custom status detection can be unreliable, but try
-    for act in getattr(member, "activities", []):
-        if isinstance(act, discord.CustomActivity) and act.name:
-            if PRESENCE_TEXT.lower() in act.name.lower():
-                return True
-    return False
-
+# ---------------- parsing function (preserves ':' and handles newlines/commas) ----------------
 def parse_items_from_text(text: str) -> List[str]:
     """Parse input text into item strings.
-       Accepts newline-separated or comma-separated lists.
-       Preserves ':' characters inside items (e.g., 123:abc)."""
+       - If input contains newlines -> split by newline.
+       - Else if contains commas -> split by comma.
+       - Else -> single item.
+       Keeps ':' inside items intact."""
     if not text:
         return []
-    # Normalize line endings
     text = text.strip()
-    # If there are newlines, split by newlines
     if "\n" in text:
         lines = [l.strip() for l in text.splitlines() if l.strip()]
     elif "," in text:
-        # comma-separated on a single line
         lines = [l.strip() for l in text.split(",") if l.strip()]
     else:
-        # single item
-        lines = [text.strip()]
+        lines = [text]
     return lines
 
-# ---------------- startup (no auto sync to avoid rate limits) ----------------
+# ---------------- INVITE TRACKER ----------------
+invites_cache: dict = {}
+invite_tracker: dict = {}
+
+# ---------------- startup (populate invites cache) ----------------
 @bot.event
 async def on_ready():
+    # Populate the invites cache for all guilds the bot is in
+    for guild in bot.guilds:
+        try:
+            invites_cache[guild.id] = await guild.invites()
+        except Exception:
+            invites_cache[guild.id] = []
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
 
-    guild = discord.Object(id=GUILD_ID)
-
+# ---------------- invite events ----------------
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+    old_invites = invites_cache.get(guild.id, [])
     try:
-        synced = await bot.tree.sync(guild=guild)
-        print(f"✅ Synced {len(synced)} commands to guild")
-    except Exception as e:
-        print("Sync error:", e)
+        new_invites = await guild.invites()
+    except Exception:
+        invites_cache[guild.id] = old_invites
+        return
 
-    await bot.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.watching,
-        name=PRESENCE_TEXT
-    ))
+    inviter = None
+    for invite in new_invites:
+        matched = next((old for old in old_invites if old.code == invite.code), None)
+        if matched and invite.uses > matched.uses:
+            inviter = invite.inviter
+            break
 
-    boost_loop.start()
+    invites_cache[guild.id] = new_invites
 
-# ---------------- global app command error ----------------
+    if inviter:
+        invite_tracker.setdefault(guild.id, {})
+        invite_tracker[guild.id].setdefault(inviter.id, 0)
+        invite_tracker[guild.id][inviter.id] += 1
+
+        if invite_tracker[guild.id][inviter.id] == 5:
+            role = guild.get_role(INVITE_ROLE_ID)
+            user = guild.get_member(inviter.id)
+            if role and user:
+                try:
+                    await user.add_roles(role)
+                except Exception:
+                    pass
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    guild = member.guild
+    for inviter_id in list(invite_tracker.get(guild.id, {})):
+        if invite_tracker[guild.id][inviter_id] > 0:
+            invite_tracker[guild.id][inviter_id] -= 1
+            if invite_tracker[guild.id][inviter_id] < 5:
+                role = guild.get_role(INVITE_ROLE_ID)
+                user = guild.get_member(inviter_id)
+                if role and user and role in user.roles:
+                    try:
+                        await user.remove_roles(role)
+                    except Exception:
+                        pass
+            break
+
+# ---------------- global app command error handler ----------------
 @bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingRole):
+async def app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingRole) or isinstance(error, app_commands.CheckFailure):
         try:
             if not interaction.response.is_done():
                 await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
@@ -174,7 +210,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     if isinstance(error, app_commands.CommandNotFound):
         try:
             if not interaction.response.is_done():
-                await interaction.response.send_message("⚠️ That command isn't available on this instance. Ask an admin to run `/resync-commands`.", ephemeral=True)
+                await interaction.response.send_message("⚠️ That command isn't available. Ask an admin to run `/resync-commands`.", ephemeral=True)
         except Exception:
             pass
         return
@@ -191,7 +227,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     except Exception:
         pass
 
-# ---------------- boost loop ----------------
+# ---------------- core features: boost loop, gen UI, etc. ----------------
 @tasks.loop(minutes=5)
 async def boost_loop():
     guild = bot.get_guild(GUILD_ID)
@@ -214,7 +250,6 @@ async def boost_loop():
         except Exception:
             continue
 
-# ---------------- Gen UI ----------------
 class GenSelect(discord.ui.Select):
     def __init__(self, typ: str):
         opts = []
@@ -271,22 +306,12 @@ class GenView(discord.ui.View):
 @tree.command(name="gen", description="Generate a Free item")
 async def cmd_gen(interaction: discord.Interaction):
     await safe_load_stock()
-    # if user doesn't have free role, ask them to /verify first
     if not any(r.id == FREE_GEN_ROLE_ID for r in getattr(interaction.user, "roles", [])):
-        if user_has_required_status(interaction.user):
-            await interaction.response.send_message(
-                ("ℹ️ We detected your custom status. Run `/verify` to get Free Gen role for future access.\n\n"
-                 "If you'd like, staff can also grant you the role."),
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                ("❌ Free Gen access requires verification. Please set your custom status to include:\n"
-                 f"`{PRESENCE_TEXT}`\n\n"
-                 "Then run `/verify` to receive Free Gen role and access the generator."),
-                ephemeral=True
-            )
-            return
+        await interaction.response.send_message(
+            ("❌ Free Gen access requires the FreeGen role. Run `/verify` or ask staff."),
+            ephemeral=True
+        )
+        return
     await interaction.response.send_message("📦 Select a Free category:", view=GenView("FREE"), ephemeral=True)
 
 @tree.command(name="exclusive-gen", description="Generate an Exclusive item")
@@ -332,14 +357,14 @@ async def cmd_removecategory(interaction: discord.Interaction, category: str):
     await safe_save_stock()
     await interaction.followup.send(f"✅ Category `{category}` removed.", ephemeral=True)
 
-@tree.command(name="addstock", description="Add stock (Admin only). Provide lines or attach a .txt file")
+@tree.command(name="addstock", description="Add stock (Admin only). Provide text or attach a .txt file")
 @is_admin_check()
 @app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
 async def cmd_addstock(
     interaction: discord.Interaction,
     type: str,
     category: str,
-    stock: Optional[str] = None,
+    items: Optional[str] = None,
     file: Optional[discord.Attachment] = None
 ):
     await interaction.response.defer(ephemeral=True)
@@ -365,8 +390,8 @@ async def cmd_addstock(
         for line in lines:
             if line not in stock_data[key].get(category, []):
                 new_items.append(line)
-    elif stock:
-        lines = parse_items_from_text(stock)
+    elif items:
+        lines = parse_items_from_text(items)
         for line in lines:
             if line not in stock_data[key].get(category, []):
                 new_items.append(line)
@@ -391,7 +416,7 @@ async def cmd_removestock(
     interaction: discord.Interaction,
     type: str,
     category: str,
-    stock: Optional[str] = None,
+    items: Optional[str] = None,
     file: Optional[discord.Attachment] = None
 ):
     await interaction.response.defer(ephemeral=True)
@@ -418,8 +443,8 @@ async def cmd_removestock(
             while line in stock_data[key].get(category, []):
                 stock_data[key][category].remove(line)
                 removed += 1
-    elif stock:
-        lines = parse_items_from_text(stock)
+    elif items:
+        lines = parse_items_from_text(items)
         for line in lines:
             while line in stock_data[key].get(category, []):
                 stock_data[key][category].remove(line)
@@ -438,7 +463,7 @@ async def cmd_restock(
     interaction: discord.Interaction,
     type: str,
     category: str,
-    stock: Optional[str] = None,
+    items: Optional[str] = None,
     file: Optional[discord.Attachment] = None
 ):
     await interaction.response.defer(ephemeral=True)
@@ -462,8 +487,8 @@ async def cmd_restock(
         except Exception:
             await interaction.followup.send("❌ Could not read attached file. Use a plain .txt.", ephemeral=True)
             return
-    elif stock:
-        lines = parse_items_from_text(stock)
+    elif items:
+        lines = parse_items_from_text(items)
         new_items = list(dict.fromkeys(lines))
     else:
         await interaction.followup.send("❌ Provide stock text or attach a .txt file.", ephemeral=True)
@@ -478,35 +503,21 @@ async def cmd_restock(
     if restock_channel:
         await restock_channel.send(f"<@&{role_id}> 🚀 `{category}` fully restocked with {len(new_items)} item(s).")
 
-# ---------------- VERIFY ----------------
-@tree.command(name="verify", description="Verify your custom status and receive Free Gen role")
+# ---------------- VERIFY (no custom status) ----------------
+@tree.command(name="verify", description="Receive Free Gen role")
 async def cmd_verify(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     member = interaction.user
-    correct = False
-    for act in getattr(member, "activities", []):
-        if isinstance(act, discord.CustomActivity) and act.name:
-            if PRESENCE_TEXT.lower() in act.name.lower():
-                correct = True
-                break
-    if not correct:
-        await interaction.followup.send(
-            ("❌ Verification failed. Your custom status must include:\n"
-             f"`{PRESENCE_TEXT}`\n\n"
-             "Set that, then run `/verify` again."),
-            ephemeral=True
-        )
-        return
     role = interaction.guild.get_role(FREE_GEN_ROLE_ID)
-    if role:
-        try:
-            if role not in member.roles:
-                await member.add_roles(role)
-            await interaction.followup.send("✅ Verification successful — Free Gen role granted.", ephemeral=True)
-        except Exception:
-            await interaction.followup.send("⚠️ Could not assign role. Ensure the bot has Manage Roles permission and its role is above the FreeGen role.", ephemeral=True)
-    else:
+    if not role:
         await interaction.followup.send("⚠️ Free role not found on this server. Ask an admin to check configuration.", ephemeral=True)
+        return
+    try:
+        if role not in member.roles:
+            await member.add_roles(role)
+        await interaction.followup.send("✅ You have been granted the Free Gen role.", ephemeral=True)
+    except Exception:
+        await interaction.followup.send("⚠️ Could not assign role. Ensure the bot has Manage Roles permission and its role is above the FreeGen role.", ephemeral=True)
 
 # ---------------- REDEEM MODAL ----------------
 class RedeemModal(discord.ui.Modal, title="Redeem Exclusive Gift Card"):
