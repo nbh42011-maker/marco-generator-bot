@@ -1,9 +1,10 @@
-# bot.py — Full working generator bot
-# - No /verify command
-# - /invites shows invite progress
-# - Robust /addstock (text OR .txt; preserves ':' inside items)
-# - Invite tracker (5 invites -> role)
-# - Tasks start safely inside on_ready()
+# bot.py — Complete generator bot
+# - Fixed /addstock (items field or .txt file)
+# - Autocomplete for stock_type (F -> Free)
+# - Category autocomplete
+# - Invite tracker (5 invites => role)
+# - Auto-delete plain messages in two channels (keeps commands/webhooks/apps)
+# - Tasks started in on_ready() to avoid "no running event loop" crash
 
 import os
 import json
@@ -24,7 +25,10 @@ ADMIN_ROLE_ID = 1452719764119093388
 STAFF_NOTIFY_USER_ID = 884084052854984726
 RESTOCK_CHANNEL_ID = 1478792670049599618
 
-# Invite role: default to FREE_GEN_ROLE_ID (change to specific if desired)
+# Channels where plain messages should be auto-deleted (no response)
+AUTODELETE_CHANNELS = {1478790217971273788, 1454503001363583019}
+
+# Invite role (defaults to free gen role; change if you want different)
 INVITE_ROLE_ID = FREE_GEN_ROLE_ID
 
 STOCK_FILE = "stock.json"
@@ -102,7 +106,7 @@ async def category_autocomplete(interaction: discord.Interaction, current: str):
     cats = stock_data.get("categories", [])
     return [app_commands.Choice(name=c, value=c) for c in cats if current.lower() in c.lower()][:25]
 
-async def type_autocomplete(interaction: discord.Interaction, current: str):
+async def stock_type_autocomplete(interaction: discord.Interaction, current: str):
     opts = ["free", "exclusive"]
     return [app_commands.Choice(name=o.capitalize(), value=o) for o in opts if current.lower() in o.lower()][:25]
 
@@ -124,7 +128,7 @@ def format_stock_embed():
 def parse_items_from_text(text: str) -> List[str]:
     """
     Converts text -> list of items.
-    - If newlines exist -> split by newline (preferred).
+    - If newlines exist -> split by newline.
     - Else if commas exist -> split by comma.
     - Else -> single item.
     Preserves ':' inside items (e.g. email:pass).
@@ -144,7 +148,7 @@ def parse_items_from_text(text: str) -> List[str]:
 invites_cache: Dict[int, List[discord.Invite]] = {}
 invite_tracker: Dict[int, Dict[int, int]] = {}  # guild_id -> {inviter_id: count}
 
-# ---------------- background loops (defined, started in on_ready) ----------------
+# ---------------- background loops (start in on_ready) ----------------
 @tasks.loop(minutes=5)
 async def boost_loop():
     guild = bot.get_guild(GUILD_ID)
@@ -275,28 +279,22 @@ async def cmd_removecategory(interaction: discord.Interaction, category: str):
     await safe_save_stock()
     await interaction.followup.send(f"✅ Category `{category}` removed.", ephemeral=True)
 
+# ---- addstock: accepts 'items' text or 'file' attachment. stock_type param uses autocomplete. ----
 @tree.command(name="addstock", description="Add stock (Admin only). Provide text or attach a .txt file")
 @is_admin_check()
-@app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
+@app_commands.autocomplete(stock_type=stock_type_autocomplete, category=category_autocomplete)
 async def cmd_addstock(
     interaction: discord.Interaction,
-    type: str,
-    category: str,
-    items: Optional[str] = None,
-    file: Optional[discord.Attachment] = None
+    stock_type: str,                  # 'free' or 'exclusive' (autocomplete)
+    category: str,                    # category name (autocomplete)
+    items: Optional[str] = None,      # paste multi-line or comma-separated list
+    file: Optional[discord.Attachment] = None  # attach .txt
 ):
     """
-    Use the 'items' field (paste multi-line or comma-separated list) OR attach a .txt file.
-    Examples:
-      - Multi-line:
-          email1:pass1
-          email2:pass2
-      - Single line, comma separated:
-          email1:pass1, email2:pass2
-      - .txt file: one item per line (or comma-separated single line)
+    Use 'items' (paste multi-line or comma-separated list) OR attach a .txt file.
     """
     await interaction.response.defer(ephemeral=True)
-    t = type.lower()
+    t = stock_type.lower()
     if t not in ("free", "exclusive"):
         await interaction.followup.send("❌ Type must be `free` or `exclusive`.", ephemeral=True)
         return
@@ -324,7 +322,7 @@ async def cmd_addstock(
             if line not in stock_data[key].get(category, []):
                 new_items.append(line)
     else:
-        await interaction.followup.send("❌ Provide stock text (one per line) or attach a .txt file.", ephemeral=True)
+        await interaction.followup.send("❌ Provide stock text (one per line) in the **items** field or attach a .txt file.", ephemeral=True)
         return
 
     stock_data[key].setdefault(category, []).extend(new_items)
@@ -342,16 +340,16 @@ async def cmd_addstock(
 
 @tree.command(name="removestock", description="Remove stock items (Admin only). Provide text or attach .txt")
 @is_admin_check()
-@app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
+@app_commands.autocomplete(stock_type=stock_type_autocomplete, category=category_autocomplete)
 async def cmd_removestock(
     interaction: discord.Interaction,
-    type: str,
+    stock_type: str,
     category: str,
     items: Optional[str] = None,
     file: Optional[discord.Attachment] = None
 ):
     await interaction.response.defer(ephemeral=True)
-    t = type.lower()
+    t = stock_type.lower()
     if t not in ("free", "exclusive"):
         await interaction.followup.send("❌ Type must be `free` or `exclusive`.", ephemeral=True)
         return
@@ -389,16 +387,16 @@ async def cmd_removestock(
 
 @tree.command(name="restock", description="Replace stock for a category (Admin only)")
 @is_admin_check()
-@app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
+@app_commands.autocomplete(stock_type=stock_type_autocomplete, category=category_autocomplete)
 async def cmd_restock(
     interaction: discord.Interaction,
-    type: str,
+    stock_type: str,
     category: str,
     items: Optional[str] = None,
     file: Optional[discord.Attachment] = None
 ):
     await interaction.response.defer(ephemeral=True)
-    t = type.lower()
+    t = stock_type.lower()
     if t not in ("free", "exclusive"):
         await interaction.followup.send("❌ Type must be `free` or `exclusive`.", ephemeral=True)
         return
@@ -440,10 +438,6 @@ async def cmd_restock(
 # ---------------- INVITES (replaces /verify) ----------------
 @tree.command(name="invites", description="See progress toward Free Gen role (5 invites required)")
 async def cmd_invites(interaction: discord.Interaction):
-    """
-    Reports the number of invites the user currently has according to our tracker.
-    This is a best-effort counter based on tracked invite uses while the bot was online.
-    """
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     if not guild:
@@ -452,7 +446,6 @@ async def cmd_invites(interaction: discord.Interaction):
     inviter_id = interaction.user.id
     count = invite_tracker.get(guild.id, {}).get(inviter_id, 0)
     needed = max(0, 5 - count)
-    # Professional, engaging message
     embed = discord.Embed(
         title="🎯 Free Gen Invite Progress",
         description=(f"Invite friends to earn the Free Gen role — it's quick and totally free!\n\n"
@@ -535,7 +528,7 @@ async def global_appcmd_error(interaction: discord.Interaction, error: app_comma
     except Exception:
         pass
 
-# ---------------- invite events ----------------
+# ---------------- INVITE EVENTS ----------------
 @bot.event
 async def on_member_join(member: discord.Member):
     guild = member.guild
@@ -589,7 +582,7 @@ async def on_member_remove(member: discord.Member):
                         pass
             break
 
-# ---------------- on_ready (start tasks safely + populate invite cache) ----------------
+# ---------------- on_ready (start loops and populate invite cache) ----------------
 @bot.event
 async def on_ready():
     # populate invites cache
@@ -598,13 +591,14 @@ async def on_ready():
             invites_cache[guild.id] = await guild.invites()
         except Exception:
             invites_cache[guild.id] = []
+
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
 
-    # start background loops safely (only when ready)
+    # start background loop(s) only when ready
     if not boost_loop.is_running():
         boost_loop.start()
 
-    # optional one-time auto-sync (enable SYNC_ON_START=1 in env for initial registration)
+    # optional one-time sync (enable SYNC_ON_START=1 in env to use once)
     if os.getenv("SYNC_ON_START", "0") == "1":
         try:
             guild_obj = discord.Object(id=GUILD_ID)
@@ -612,6 +606,39 @@ async def on_ready():
             print(f"✅ One-time sync complete — {len(synced)} commands synced to guild.")
         except Exception as e:
             print(f"[SYNC ERROR] {e}")
+
+# ---------------- on_message: auto-delete plain user messages in certain channels ----------------
+@bot.event
+async def on_message(message: discord.Message):
+    # allow bots, webhooks, apps, commands to pass
+    if message.author.bot:
+        return
+
+    # don't delete messages from webhooks
+    if message.webhook_id is not None:
+        return
+
+    # Do not delete application/command messages (they have different message types)
+    if message.type != discord.MessageType.default:
+        return
+
+    # If the message starts with '/' assume user is invoking a slash command (do not delete)
+    if message.content and message.content.startswith("/"):
+        return
+
+    # Only auto-delete in the defined channels
+    if message.channel.id in AUTODELETE_CHANNELS:
+        try:
+            # Do not delete if the message is an app message or from an integration
+            if message.author.system:
+                return
+            # Delete silently
+            await message.delete()
+        except Exception:
+            pass
+
+    # let other handlers run (prefix commands)
+    await bot.process_commands(message)
 
 # ---------------- RUN ----------------
 if __name__ == "__main__":
