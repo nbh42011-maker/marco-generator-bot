@@ -1,9 +1,8 @@
-# bot.py — Final production-ready generator bot
-# - /addstock fixed (items text or .txt)
-# - Autocomplete for stock_type and category
-# - Auto-delete plain messages in specified channels (keeps webhooks/apps/commands)
-# - Invite tracker (5 invites => role)
-# - Tasks start in on_ready to avoid event loop crash
+# bot.py — Final full working generator bot
+# - Use environment variable TOKEN for the bot token
+# - Place this file in your repo and deploy (Railway / other)
+# - Make sure requirements.txt contains: discord.py, aiohttp
+# - After first deploy you can remove or set SYNC_ON_START=0 to avoid repeated syncs.
 
 import os
 import json
@@ -16,8 +15,8 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ---------------- CONFIG (change IDs if needed) ----------------
-GUILD_ID = 1452717489656954961
-FREE_GEN_ROLE_ID = 1467913996723032315
+GUILD_ID = 1452717489656954961          # Your server ID
+FREE_GEN_ROLE_ID = 1467913996723032315  # FreeGen role
 EXCLUSIVE_ROLE_ID = 1453906576237924603
 BOOST_ROLE_ID = 1453187878061478019
 ADMIN_ROLE_ID = 1452719764119093388
@@ -27,7 +26,7 @@ RESTOCK_CHANNEL_ID = 1478792670049599618
 # Channels where plain user messages should be auto-deleted (no response)
 AUTODELETE_CHANNELS = {1478790217971273788, 1454503001363583019}
 
-# Invite role (default to FREE_GEN_ROLE_ID; change if desired)
+# Invite role (defaults to FREE_GEN_ROLE_ID). Change if you want a separate invite reward role.
 INVITE_ROLE_ID = FREE_GEN_ROLE_ID
 
 STOCK_FILE = "stock.json"
@@ -35,7 +34,10 @@ STOCK_FILE = "stock.json"
 # cooldowns (seconds)
 FREE_COOLDOWN = 180
 EXCL_COOLDOWN = 60
-RESYNC_COOLDOWN = 60 * 60  # 1 hour
+RESYNC_COOLDOWN = 60 * 60  # 1 hour between manual resyncs
+
+# Optional: if set to "1" the bot will attempt a one-time guild sync on_ready
+SYNC_ON_START = os.getenv("SYNC_ON_START", "0") == "1"
 
 # ---------------- INTENTS & BOT ----------------
 intents = discord.Intents.default()
@@ -43,10 +45,10 @@ intents.members = True
 intents.message_content = True
 intents.presences = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 tree = bot.tree
 
-# ---------------- STORAGE & LOCK ----------------
+# ---------------- storage & lock ----------------
 _file_lock = asyncio.Lock()
 
 def _ensure_stock_file():
@@ -75,7 +77,7 @@ async def safe_save_stock():
     async with _file_lock:
         _save_stock_to_disk(stock_data)
 
-# ---------------- cooldowns / resync ----------------
+# ---------------- cooldowns / resync guard ----------------
 _cooldowns: Dict = {}
 _last_resync_ts = 0
 
@@ -92,14 +94,16 @@ def check_cooldown(user_id: int, typ: str) -> int:
 def set_cooldown(user_id: int, typ: str):
     _cooldowns[(user_id, typ)] = now_ts()
 
-# ---------------- admin-check decorator ----------------
+# ---------------- admin-check helper ----------------
 def is_admin_check():
     async def predicate(interaction: discord.Interaction) -> bool:
         user = interaction.user
+        if not hasattr(user, "roles"):
+            return False
         return any(r.id == ADMIN_ROLE_ID for r in getattr(user, "roles", []))
     return app_commands.check(predicate)
 
-# ---------------- autocompletes ----------------
+# ---------------- autocomplete helpers ----------------
 async def category_autocomplete(interaction: discord.Interaction, current: str):
     await safe_load_stock()
     cats = stock_data.get("categories", [])
@@ -123,14 +127,14 @@ def format_stock_embed():
     embed.set_footer(text="Automated • Marcos Gen")
     return embed
 
-# ---------------- parsing helper ----------------
+# ---------------- parsing helper (preserves ':') ----------------
 def parse_items_from_text(text: str) -> List[str]:
     """
-    Converts text -> list of items.
-    - If newlines exist -> split by newline (preferred).
-    - Else if commas exist -> split by comma.
-    - Else -> single item.
-    Preserves ':' inside items (e.g. email:pass).
+    Parse input text into list of items.
+    - If text contains newlines -> split on newlines (preferred)
+    - Else if contains commas -> split on commas
+    - Else -> single item
+    Keeps ':' characters intact.
     """
     if not text:
         return []
@@ -143,11 +147,11 @@ def parse_items_from_text(text: str) -> List[str]:
         lines = [text]
     return lines
 
-# ---------------- invite tracker ----------------
+# ---------------- invite tracking ----------------
 invites_cache: Dict[int, List[discord.Invite]] = {}
 invite_tracker: Dict[int, Dict[int, int]] = {}  # guild_id -> {inviter_id: count}
 
-# ---------------- background loops (defined, started in on_ready) ----------------
+# ---------------- background loops (start in on_ready) ----------------
 @tasks.loop(minutes=5)
 async def boost_loop():
     guild = bot.get_guild(GUILD_ID)
@@ -170,7 +174,7 @@ async def boost_loop():
         except Exception:
             continue
 
-# ---------------- Gen UI ----------------
+# ---------------- gen UI ----------------
 class GenSelect(discord.ui.Select):
     def __init__(self, typ: str):
         opts = []
@@ -223,7 +227,7 @@ class GenView(discord.ui.View):
         super().__init__(timeout=60)
         self.add_item(GenSelect(typ))
 
-# ---------------- USER COMMANDS ----------------
+# ---------------- user commands ----------------
 @tree.command(name="gen", description="Generate a Free item")
 async def cmd_gen(interaction: discord.Interaction):
     await safe_load_stock()
@@ -249,7 +253,7 @@ async def cmd_stock(interaction: discord.Interaction):
     embed = format_stock_embed()
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ---------------- ADMIN COMMANDS ----------------
+# ---------------- admin commands ----------------
 @tree.command(name="addcategory", description="Add a category (Admin only)")
 @is_admin_check()
 async def cmd_addcategory(interaction: discord.Interaction, category: str):
@@ -278,16 +282,15 @@ async def cmd_removecategory(interaction: discord.Interaction, category: str):
     await safe_save_stock()
     await interaction.followup.send(f"✅ Category `{category}` removed.", ephemeral=True)
 
-# ---- addstock: accepts 'items' text or 'file' attachment. stock_type param uses autocomplete. ----
 @tree.command(name="addstock", description="Add stock (Admin only). Provide text or attach a .txt file")
 @is_admin_check()
 @app_commands.autocomplete(stock_type=stock_type_autocomplete, category=category_autocomplete)
 async def cmd_addstock(
     interaction: discord.Interaction,
-    stock_type: str,                  # 'free' or 'exclusive' (autocomplete)
-    category: str,                    # category name (autocomplete)
-    items: Optional[str] = None,      # paste multi-line or comma-separated list
-    file: Optional[discord.Attachment] = None  # attach .txt
+    stock_type: str,
+    category: str,
+    items: Optional[str] = None,
+    file: Optional[discord.Attachment] = None
 ):
     """
     Use 'items' (paste multi-line or comma-separated list) OR attach a .txt file.
@@ -434,7 +437,7 @@ async def cmd_restock(
         except Exception:
             pass
 
-# ---------------- INVITES (replaces /verify) ----------------
+# ---------------- invites (replaces /verify) ----------------
 @tree.command(name="invites", description="See progress toward Free Gen role (5 invites required)")
 async def cmd_invites(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -456,7 +459,7 @@ async def cmd_invites(interaction: discord.Interaction):
     embed.set_footer(text="Invites tracked while bot is online — counts are best-effort.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# ---------------- REDEEM MODAL ----------------
+# ---------------- redeem modal ----------------
 class RedeemModal(discord.ui.Modal, title="Redeem Exclusive Gift Card"):
     payment_type = discord.ui.TextInput(label="Payment Type", placeholder="e.g. PayPal, CashApp, Gift Card")
     code = discord.ui.TextInput(label="Redeem Code", placeholder="Paste the redeem code here")
@@ -477,7 +480,7 @@ class RedeemModal(discord.ui.Modal, title="Redeem Exclusive Gift Card"):
 async def cmd_redeem(interaction: discord.Interaction):
     await interaction.response.send_modal(RedeemModal())
 
-# ---------------- RESYNC (admin, guarded) ----------------
+# ---------------- resync (admin, guarded) ----------------
 @tree.command(name="resync-commands", description="(Admin) Register/sync commands to the guild (use only if needed)")
 @is_admin_check()
 async def cmd_resync(interaction: discord.Interaction):
@@ -500,6 +503,7 @@ async def cmd_resync(interaction: discord.Interaction):
 # ---------------- global app command error handler ----------------
 @bot.tree.error
 async def global_appcmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # Handle common app command errors gracefully
     if isinstance(error, app_commands.MissingRole) or isinstance(error, app_commands.CheckFailure):
         try:
             if not interaction.response.is_done():
@@ -514,7 +518,7 @@ async def global_appcmd_error(interaction: discord.Interaction, error: app_comma
         except Exception:
             pass
         return
-    # fallback
+    # fallback: notify staff and user
     print(f"[AppCommandError] {error!r}")
     try:
         if not interaction.response.is_done():
@@ -527,7 +531,7 @@ async def global_appcmd_error(interaction: discord.Interaction, error: app_comma
     except Exception:
         pass
 
-# ---------------- INVITE EVENTS ----------------
+# ---------------- invite events ----------------
 @bot.event
 async def on_member_join(member: discord.Member):
     guild = member.guild
@@ -581,7 +585,7 @@ async def on_member_remove(member: discord.Member):
                         pass
             break
 
-# ---------------- on_ready (start loops and populate invite cache) ----------------
+# ---------------- on_ready: populate invite cache, start loops, optionally sync ----------------
 @bot.event
 async def on_ready():
     # populate invites cache
@@ -593,59 +597,63 @@ async def on_ready():
 
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
 
-    # start background loops safely (only when ready)
+    # start background loops safely
     if not boost_loop.is_running():
         boost_loop.start()
 
-    # optional one-time sync (enable SYNC_ON_START=1 in env to use once)
-    if os.getenv("SYNC_ON_START", "0") == "1":
+    # Force a guild-only sync to eliminate command signature mismatches (best practice)
+    # This sync is scoped to the configured GUILD_ID to avoid global rate limits.
+    try:
+        guild_obj = discord.Object(id=GUILD_ID)
+        synced = await tree.sync(guild=guild_obj)
+        print(f"✅ Commands synced to guild ({len(synced)} commands).")
+    except Exception as e:
+        print(f"[SYNC ERROR] {e}")
+
+    # Optional extra one-time automatic sync (disabled by default); keep OFF once working to avoid rate-limits.
+    if SYNC_ON_START:
         try:
-            guild_obj = discord.Object(id=GUILD_ID)
-            synced = await tree.sync(guild=guild_obj)
-            print(f"✅ One-time sync complete — {len(synced)} commands synced to guild.")
+            all_synced = await tree.sync()
+            print(f"[SYNC_ON_START] global sync: {len(all_synced)} commands")
         except Exception as e:
-            print(f"[SYNC ERROR] {e}")
+            print(f"[SYNC_ON_START ERROR] {e}")
 
 # ---------------- on_message: auto-delete plain user messages in certain channels ----------------
 @bot.event
 async def on_message(message: discord.Message):
-    # allow bots, webhooks, apps, commands to pass
+    # allow bots and webhooks and application messages
     if message.author.bot:
-        await bot.process_commands(message)  # still allow commands if bot authored (safety)
+        await bot.process_commands(message)
         return
 
-    # don't delete messages from webhooks
     if message.webhook_id is not None:
         await bot.process_commands(message)
         return
 
-    # Do not delete application/command messages (they have different message types)
     if message.type != discord.MessageType.default:
         await bot.process_commands(message)
         return
 
-    # If the message starts with '/' assume user is invoking a slash command (do not delete)
+    # If the message starts with '/', assume user is invoking a slash command — do not delete
     if message.content and message.content.startswith("/"):
         await bot.process_commands(message)
         return
 
-    # Only auto-delete in the defined channels
+    # Only auto-delete in configured channels
     if message.channel.id in AUTODELETE_CHANNELS:
         try:
-            # Delete silently (do not respond)
             await message.delete()
         except Exception:
             pass
         return
 
-    # allow normal processing for other messages
     await bot.process_commands(message)
 
-# ---------------- RUN ----------------
+# ---------------- run ----------------
 if __name__ == "__main__":
     TOKEN = os.getenv("TOKEN")
     if not TOKEN:
-        print("[ERROR] TOKEN env var not set.")
+        print("[ERROR] TOKEN env var not set. Please set TOKEN in Railway or your host.")
     else:
         _ensure_stock_file()
         stock_data = _load_stock_from_disk()
