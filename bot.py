@@ -1,5 +1,5 @@
-# bot.py — Full working generator bot (paste/overwrite your file with this)
-# Requirements: discord.py, aiohttp, requests (requests optional)
+# bot.py — Fixed: guild-scoped commands + live invite granting
+# Requirements: discord.py>=2.x, aiohttp
 # Set TOKEN env var in Railway/GitHub/host and deploy
 
 import os
@@ -14,36 +14,30 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ---------------- CONFIG ----------------
-GUILD_ID = 1452717489656954961          # Your server ID (int)
-APPLICATION_ID = "1478522023696273428"  # Application / client id (string)
-FREE_GEN_ROLE_ID = 1467913996723032315  # FreeGen role id
+GUILD_ID = 1452717489656954961          # int: your server id
+APPLICATION_ID = "1478522023696273428"  # str: application / client id
+FREE_GEN_ROLE_ID = 1467913996723032315  # int
 EXCLUSIVE_ROLE_ID = 1453906576237924603
 BOOST_ROLE_ID = 1453187878061478019
 ADMIN_ROLE_ID = 1452719764119093388
 STAFF_NOTIFY_USER_ID = 884084052854984726
 RESTOCK_CHANNEL_ID = 1478792670049599618
 
-# Auto-delete user plain messages in these channels
 AUTODELETE_CHANNELS = {1478790217971273788, 1454503001363583019}
-
-# Invite role (earned at 5 invites)
 INVITE_ROLE_ID = FREE_GEN_ROLE_ID
 
 STOCK_FILE = "stock.json"
 
-# cooldowns (seconds)
 FREE_COOLDOWN = 180
 EXCL_COOLDOWN = 60
-RESYNC_COOLDOWN = 60 * 60  # 1 hour between manual resyncs
+RESYNC_COOLDOWN = 60 * 60
 
-# One-time clearing flags (marker files)
 _CLEARED_MARKER = "commands_cleared.lock"
 _CLEARED_GLOBAL_MARKER = "commands_cleared_global.lock"
 
-# Optional: set env SYNC_ON_START=1 to attempt a one-time global sync
 SYNC_ON_START = os.getenv("SYNC_ON_START", "0") == "1"
 
-# ---------------- INTENTS & BOT ----------------
+# ---------------- BOT ----------------
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
@@ -52,7 +46,7 @@ intents.presences = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 tree = bot.tree
 
-# ---------------- storage & lock ----------------
+# ---------------- storage ----------------
 _file_lock = asyncio.Lock()
 
 def _ensure_stock_file():
@@ -81,7 +75,7 @@ async def safe_save_stock():
     async with _file_lock:
         _save_stock_to_disk(stock_data)
 
-# ---------------- cooldowns / resync guard ----------------
+# ---------------- cooldowns ----------------
 _cooldowns: Dict = {}
 _last_resync_ts = 0
 
@@ -98,7 +92,7 @@ def check_cooldown(user_id: int, typ: str) -> int:
 def set_cooldown(user_id: int, typ: str):
     _cooldowns[(user_id, typ)] = now_ts()
 
-# ---------------- admin-check helper ----------------
+# ---------------- admin check ----------------
 def is_admin_check():
     async def predicate(interaction: discord.Interaction) -> bool:
         user = interaction.user
@@ -117,7 +111,7 @@ async def stock_type_autocomplete(interaction: discord.Interaction, current: str
     opts = ["free", "exclusive"]
     return [app_commands.Choice(name=o.capitalize(), value=o) for o in opts if current.lower() in o.lower()][:25]
 
-# ---------------- formatting ----------------
+# ---------------- formatting and parsing ----------------
 def format_stock_embed():
     d = stock_data
     embed = discord.Embed(title="📦 Marcos Gen • Stock Overview", color=discord.Color.blue())
@@ -131,15 +125,7 @@ def format_stock_embed():
     embed.set_footer(text="Professional • Secure • Automated")
     return embed
 
-# ---------------- parsing helper (preserves ':') ----------------
 def parse_items_from_text(text: str) -> List[str]:
-    """
-    Parse input text into list of items.
-    - If text contains newlines -> split on newlines (preferred)
-    - Else if contains commas -> split on commas
-    - Else -> single item
-    Keeps ':' characters intact.
-    """
     if not text:
         return []
     text = text.strip()
@@ -151,11 +137,11 @@ def parse_items_from_text(text: str) -> List[str]:
         lines = [text]
     return lines
 
-# ---------------- invite tracking ----------------
+# ---------------- invite tracking storage ----------------
 invites_cache: Dict[int, List[discord.Invite]] = {}
-invite_tracker: Dict[int, Dict[int, int]] = {}  # guild_id -> {inviter_id: count}
+invite_tracker: Dict[int, Dict[int, int]] = {}
 
-# ---------------- background loops (start in on_ready) ----------------
+# ---------------- boost loop ----------------
 @tasks.loop(minutes=5)
 async def boost_loop():
     guild = bot.get_guild(GUILD_ID)
@@ -219,7 +205,6 @@ class GenSelect(discord.ui.Select):
                  f"Here is your item for now:\n```{item}```"),
                 ephemeral=True
             )
-        # staff log
         try:
             staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
             await staff.send(f"[Generate] {interaction.user} ({interaction.user.id}) got item from {cat} ({self.typ})")
@@ -231,19 +216,20 @@ class GenView(discord.ui.View):
         super().__init__(timeout=60)
         self.add_item(GenSelect(typ))
 
-# ---------------- USER COMMANDS ----------------
-@tree.command(name="gen", description="Generate a Free item",)
+# ---------------- USER COMMANDS (GUILD-SCOPED) ----------------
+GUILD_OBJ = discord.Object(id=GUILD_ID)
+
+@tree.command(name="gen", description="Generate a Free item", guild=GUILD_OBJ)
 async def cmd_gen(interaction: discord.Interaction):
     await safe_load_stock()
     if not any(r.id == FREE_GEN_ROLE_ID for r in getattr(interaction.user, "roles", [])):
         await interaction.response.send_message(
-            ("❌ Free Gen access requires the FreeGen role. You can earn it by inviting friends — run `/invites` to see your progress."),
-            ephemeral=True
+            ("❌ Free Gen access requires the FreeGen role. Run `/invites` to see progress."), ephemeral=True
         )
         return
     await interaction.response.send_message("📦 Select a Free category:", view=GenView("FREE"), ephemeral=True)
 
-@tree.command(name="exclusive-gen", description="Generate an Exclusive item")
+@tree.command(name="exclusive-gen", description="Generate an Exclusive item", guild=GUILD_OBJ)
 async def cmd_exclusive_gen(interaction: discord.Interaction):
     if EXCLUSIVE_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
         await interaction.response.send_message("❌ You need the Exclusive role to use this command.", ephemeral=True)
@@ -251,14 +237,14 @@ async def cmd_exclusive_gen(interaction: discord.Interaction):
     await safe_load_stock()
     await interaction.response.send_message("💎 Select an Exclusive category:", view=GenView("EXCLUSIVE"), ephemeral=True)
 
-@tree.command(name="stock", description="View current stock")
+@tree.command(name="stock", description="View current stock", guild=GUILD_OBJ)
 async def cmd_stock(interaction: discord.Interaction):
     await safe_load_stock()
     embed = format_stock_embed()
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ---------------- ADMIN COMMANDS ----------------
-@tree.command(name="addcategory", description="Add a category (Admin only)")
+# ---------------- ADMIN COMMANDS (GUILD-SCOPED) ----------------
+@tree.command(name="addcategory", description="Add a category (Admin only)", guild=GUILD_OBJ)
 @is_admin_check()
 async def cmd_addcategory(interaction: discord.Interaction, category: str):
     await interaction.response.defer(ephemeral=True)
@@ -272,7 +258,7 @@ async def cmd_addcategory(interaction: discord.Interaction, category: str):
     await safe_save_stock()
     await interaction.followup.send(f"✅ Category `{category}` added.", ephemeral=True)
 
-@tree.command(name="removecategory", description="Remove a category (Admin only)")
+@tree.command(name="removecategory", description="Remove a category (Admin only)", guild=GUILD_OBJ)
 @is_admin_check()
 async def cmd_removecategory(interaction: discord.Interaction, category: str):
     await interaction.response.defer(ephemeral=True)
@@ -286,7 +272,7 @@ async def cmd_removecategory(interaction: discord.Interaction, category: str):
     await safe_save_stock()
     await interaction.followup.send(f"✅ Category `{category}` removed.", ephemeral=True)
 
-@tree.command(name="addstock", description="Add stock (Admin only). Provide text or attach a .txt file")
+@tree.command(name="addstock", description="Add stock (Admin only). Provide text or attach a .txt file", guild=GUILD_OBJ)
 @is_admin_check()
 @app_commands.autocomplete(stock_type=stock_type_autocomplete, category=category_autocomplete)
 async def cmd_addstock(
@@ -332,7 +318,6 @@ async def cmd_addstock(
     await safe_save_stock()
     await interaction.followup.send(f"✅ Added {len(new_items)} item(s) to `{category}`.", ephemeral=True)
 
-    # Ping restock channel (best-effort)
     restock_channel = bot.get_channel(RESTOCK_CHANNEL_ID) or (interaction.guild.get_channel(RESTOCK_CHANNEL_ID) if interaction.guild else None)
     role_id = FREE_GEN_ROLE_ID if key == "FREE" else EXCLUSIVE_ROLE_ID
     if restock_channel:
@@ -341,7 +326,7 @@ async def cmd_addstock(
         except Exception:
             pass
 
-@tree.command(name="removestock", description="Remove stock items (Admin only). Provide text or attach .txt")
+@tree.command(name="removestock", description="Remove stock items (Admin only). Provide text or attach .txt", guild=GUILD_OBJ)
 @is_admin_check()
 @app_commands.autocomplete(stock_type=stock_type_autocomplete, category=category_autocomplete)
 async def cmd_removestock(
@@ -388,7 +373,7 @@ async def cmd_removestock(
     await safe_save_stock()
     await interaction.followup.send(f"✅ Removed {removed} item(s) from `{category}`.", ephemeral=True)
 
-@tree.command(name="restock", description="Replace stock for a category (Admin only)")
+@tree.command(name="restock", description="Replace stock for a category (Admin only)", guild=GUILD_OBJ)
 @is_admin_check()
 @app_commands.autocomplete(stock_type=stock_type_autocomplete, category=category_autocomplete)
 async def cmd_restock(
@@ -438,23 +423,50 @@ async def cmd_restock(
         except Exception:
             pass
 
-# ---------------- invites (replaces /verify) ----------------
-@tree.command(name="invites", description="See progress toward Free Gen role (5 invites required)")
+# ---------------- INVITES: live count & auto-grant role ----------------
+@tree.command(name="invites", description="See progress toward Free Gen role (5 invites required)", guild=GUILD_OBJ)
 async def cmd_invites(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
+    guild = interaction.guild or bot.get_guild(GUILD_ID)
     if not guild:
         await interaction.followup.send("This command must be used in a server.", ephemeral=True)
         return
-    inviter_id = interaction.user.id
-    count = invite_tracker.get(guild.id, {}).get(inviter_id, 0)
+
+    # fetch current invites and compute uses for this user
+    try:
+        invites = await guild.invites()
+    except Exception:
+        invites = invites_cache.get(guild.id, [])
+
+    count = 0
+    for inv in invites:
+        try:
+            if inv.inviter and inv.inviter.id == interaction.user.id:
+                count += inv.uses
+        except Exception:
+            continue
+
+    # update in-memory tracker
+    invite_tracker.setdefault(guild.id, {})[interaction.user.id] = count
+
+    # auto-assign role if threshold reached
     needed = max(0, 5 - count)
+    role = guild.get_role(INVITE_ROLE_ID)
+    member = guild.get_member(interaction.user.id)
+    granted = False
+    if count >= 5 and role and member and role not in member.roles:
+        try:
+            await member.add_roles(role)
+            granted = True
+        except Exception:
+            granted = False
+
     embed = discord.Embed(
         title="🎯 Free Gen Invite Progress",
         description=(f"Invite friends to earn the Free Gen role — it's quick and totally free!\n\n"
                      f"**Your progress:** {count} invite(s)\n"
                      f"**Remaining to earn role:** {needed}\n\n"
-                     "When you reach 5 invites you'll automatically receive the Free Gen role. Keep sharing the invite link!"),
+                     f"{'✅ Role granted automatically.' if granted else ''}"),
         color=discord.Color.green()
     )
     embed.set_footer(text="Invites tracked while bot is online — counts are best-effort.")
@@ -477,12 +489,12 @@ class RedeemModal(discord.ui.Modal, title="Redeem Exclusive Gift Card"):
             pass
         await interaction.followup.send("✅ Your code has been submitted for verification. Staff will review shortly.", ephemeral=True)
 
-@tree.command(name="redeem-exclusive", description="Redeem Exclusive access via gift card")
+@tree.command(name="redeem-exclusive", description="Redeem Exclusive access via gift card", guild=GUILD_OBJ)
 async def cmd_redeem(interaction: discord.Interaction):
     await interaction.response.send_modal(RedeemModal())
 
-# ---------------- resync (admin, guarded) ----------------
-@tree.command(name="resync-commands", description="(Admin) Register/sync commands to the guild (use only if needed)")
+# ---------------- resync (admin) ----------------
+@tree.command(name="resync-commands", description="(Admin) Register/sync commands to the guild", guild=GUILD_OBJ)
 @is_admin_check()
 async def cmd_resync(interaction: discord.Interaction):
     global _last_resync_ts
@@ -507,7 +519,6 @@ async def cmd_resync(interaction: discord.Interaction):
 # ---------------- global app command error handler ----------------
 @bot.tree.error
 async def global_appcmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    # Handle common app command errors gracefully
     if isinstance(error, app_commands.MissingRole) or isinstance(error, app_commands.CheckFailure):
         try:
             if not interaction.response.is_done():
@@ -522,7 +533,6 @@ async def global_appcmd_error(interaction: discord.Interaction, error: app_comma
         except Exception:
             pass
         return
-    # fallback: notify staff and user
     print(f"[AppCommandError] {error!r}")
     try:
         if not interaction.response.is_done():
@@ -535,7 +545,7 @@ async def global_appcmd_error(interaction: discord.Interaction, error: app_comma
     except Exception:
         pass
 
-# ---------------- invite events ----------------
+# ---------------- member events ----------------
 @bot.event
 async def on_member_join(member: discord.Member):
     guild = member.guild
@@ -559,14 +569,13 @@ async def on_member_join(member: discord.Member):
         invite_tracker.setdefault(guild.id, {})
         invite_tracker[guild.id].setdefault(inviter.id, 0)
         invite_tracker[guild.id][inviter.id] += 1
-
-        # Grant role at 5 invites
+        # grant role if threshold reached
         if invite_tracker[guild.id][inviter.id] >= 5:
             role = guild.get_role(INVITE_ROLE_ID)
             user = guild.get_member(inviter.id)
-            if role and user:
+            if role and user and role not in user.roles:
                 try:
-                    await user.add_roles(role)
+                    asyncio.create_task(user.add_roles(role))
                 except Exception:
                     pass
 
@@ -584,12 +593,12 @@ async def on_member_remove(member: discord.Member):
                 user = guild.get_member(inviter_id)
                 if role and user and role in user.roles:
                     try:
-                        await user.remove_roles(role)
+                        asyncio.create_task(user.remove_roles(role))
                     except Exception:
                         pass
             break
 
-# ---------------- on_ready: one-time HTTP clears + safe sync ----------------
+# ---------------- on_ready: one-time HTTP clears + sync ----------------
 @bot.event
 async def on_ready():
     # populate invites cache
@@ -601,11 +610,10 @@ async def on_ready():
 
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
 
-    # start background loops safely
     if not boost_loop.is_running():
         boost_loop.start()
 
-    # --- ONE-TIME: clear guild commands via HTTP (safe for mobile) ---
+    # --- one-time guild clear via HTTP (marker-protected) ---
     try:
         if not os.path.exists(_CLEARED_MARKER):
             TOKEN = os.getenv("TOKEN")
@@ -637,7 +645,7 @@ async def on_ready():
     except Exception as e:
         print(f"[CLEAR ERROR] unexpected: {e}")
 
-    # --- ONE-TIME: clear GLOBAL commands via HTTP if mismatch persists ---
+    # --- one-time GLOBAL clear via HTTP if needed ---
     try:
         if not os.path.exists(_CLEARED_GLOBAL_MARKER):
             TOKEN = os.getenv("TOKEN")
@@ -669,21 +677,13 @@ async def on_ready():
     except Exception as e:
         print(f"[GLOBAL CLEAR ERROR] unexpected: {e}")
 
-    # --- SYNC commands to the guild (safe sync) ---
+    # --- sync commands to the guild (forces immediate registration) ---
     try:
-        guild = bot.get_guild(GUILD_ID)
-        if guild is None:
-            print(f"[SYNC ERROR] Guild {GUILD_ID} not present in bot.guilds. Skipping guild sync.")
-        else:
-            try:
-                synced = await tree.sync(guild=guild)
-                print(f"✅ Commands synced to guild ({len(synced)} commands).")
-            except Exception as e:
-                print(f"[SYNC ERROR] when syncing to guild: {e}")
+        synced = await tree.sync(guild=GUILD_OBJ)
+        print(f"✅ Commands synced to guild ({len(synced)} commands).")
     except Exception as e:
-        print(f"[SYNC ERROR] unexpected: {e}")
+        print(f"[SYNC ERROR] when syncing to guild: {e}")
 
-    # Optional one-time global sync (only if SYNC_ON_START true)
     if SYNC_ON_START:
         try:
             all_synced = await tree.sync()
@@ -691,38 +691,30 @@ async def on_ready():
         except Exception as e:
             print(f"[SYNC_ON_START ERROR] {e}")
 
-# ---------------- on_message: auto-delete plain user messages in certain channels ----------------
+# ---------------- on_message auto-delete ----------------
 @bot.event
 async def on_message(message: discord.Message):
-    # allow bots and webhooks and application messages
     if message.author.bot:
         await bot.process_commands(message)
         return
-
     if message.webhook_id is not None:
         await bot.process_commands(message)
         return
-
     if message.type != discord.MessageType.default:
         await bot.process_commands(message)
         return
-
-    # If the message starts with '/', assume user is invoking a slash command — do not delete
     if message.content and message.content.startswith("/"):
         await bot.process_commands(message)
         return
-
-    # Only auto-delete in configured channels
     if message.channel.id in AUTODELETE_CHANNELS:
         try:
             await message.delete()
         except Exception:
             pass
         return
-
     await bot.process_commands(message)
 
-# ---------------- run ----------------
+# ---------------- RUN ----------------
 if __name__ == "__main__":
     TOKEN = os.getenv("TOKEN")
     if not TOKEN:
