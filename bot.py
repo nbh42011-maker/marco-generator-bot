@@ -601,22 +601,25 @@ async def on_ready():
     if not boost_loop.is_running():
         boost_loop.start()
 
-        # ---------------- FIX: CLEAR OLD COMMANDS ----------------
-    # This prevents CommandSignatureMismatch errors on first deploy
+    # ----- FIXED CLEAR + SYNC -----
     try:
         guild_obj = discord.Object(id=GUILD_ID)
-        await tree.clear_commands(guild=guild_obj)  # <<< must be inside async function
-        print("✅ Cleared old guild commands")
-    except Exception as e:
-        print(f"[CLEAR ERROR] {e}")
-    # Force a guild-only sync to eliminate command signature mismatches (best practice)
-    # This sync is scoped to the configured GUILD_ID to avoid global rate limits.
-    try:
-        guild_obj = discord.Object(id=GUILD_ID)
+        if guild_obj:
+            # Clear existing guild commands first
+            await tree.clear_commands(guild=guild_obj)
+            print("✅ Cleared old guild commands")
         synced = await tree.sync(guild=guild_obj)
         print(f"✅ Commands synced to guild ({len(synced)} commands).")
     except Exception as e:
         print(f"[SYNC ERROR] {e}")
+
+    # Optional one-time global sync (disable after first run)
+    if SYNC_ON_START:
+        try:
+            all_synced = await tree.sync()
+            print(f"[SYNC_ON_START] global sync: {len(all_synced)} commands")
+        except Exception as e:
+            print(f"[SYNC_ON_START ERROR] {e}")
 
     # Optional extra one-time automatic sync (disabled by default); keep OFF once working to avoid rate-limits.
     if SYNC_ON_START:
