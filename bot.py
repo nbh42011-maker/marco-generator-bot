@@ -1,38 +1,32 @@
-# bot.py — Final full working generator bot
-# - Use environment variable TOKEN for the bot token
-# - Place this file in your repo and deploy (Railway / other)
-# - Make sure requirements.txt contains: discord.py, aiohttp
-# - After first deploy you can remove or set SYNC_ON_START=0 to avoid repeated syncs.
+# bot.py — Full working generator bot (paste/overwrite your file with this)
+# Requirements: discord.py, aiohttp, requests (requests optional)
+# Set TOKEN env var in Railway/GitHub/host and deploy
 
 import os
 import json
 import time
 import asyncio
-import aiohttp
 from typing import Optional, List, Dict
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-# ---------------- CONFIG (change IDs if needed) ----------------
-GUILD_ID = 1452717489656954961          # Your server ID
-FREE_GEN_ROLE_ID = 1467913996723032315  # FreeGen role
+# ---------------- CONFIG ----------------
+GUILD_ID = 1452717489656954961          # Your server ID (int)
+APPLICATION_ID = "1478522023696273428"  # Application / client id (string)
+FREE_GEN_ROLE_ID = 1467913996723032315  # FreeGen role id
 EXCLUSIVE_ROLE_ID = 1453906576237924603
 BOOST_ROLE_ID = 1453187878061478019
 ADMIN_ROLE_ID = 1452719764119093388
 STAFF_NOTIFY_USER_ID = 884084052854984726
 RESTOCK_CHANNEL_ID = 1478792670049599618
-# Application (client) id — set this to your app id
-APPLICATION_ID = "1478522023696273428"
 
-# One-time clear marker file (prevents repeated clears)
-_CLEARED_MARKER = "commands_cleared.lock"
-
-# Channels where plain user messages should be auto-deleted (no response)
+# Auto-delete user plain messages in these channels
 AUTODELETE_CHANNELS = {1478790217971273788, 1454503001363583019}
 
-# Invite role (defaults to FREE_GEN_ROLE_ID). Change if you want a separate invite reward role.
+# Invite role (earned at 5 invites)
 INVITE_ROLE_ID = FREE_GEN_ROLE_ID
 
 STOCK_FILE = "stock.json"
@@ -42,7 +36,11 @@ FREE_COOLDOWN = 180
 EXCL_COOLDOWN = 60
 RESYNC_COOLDOWN = 60 * 60  # 1 hour between manual resyncs
 
-# Optional: if set to "1" the bot will attempt a one-time guild sync on_ready
+# One-time clearing flags (marker files)
+_CLEARED_MARKER = "commands_cleared.lock"
+_CLEARED_GLOBAL_MARKER = "commands_cleared_global.lock"
+
+# Optional: set env SYNC_ON_START=1 to attempt a one-time global sync
 SYNC_ON_START = os.getenv("SYNC_ON_START", "0") == "1"
 
 # ---------------- INTENTS & BOT ----------------
@@ -122,7 +120,7 @@ async def stock_type_autocomplete(interaction: discord.Interaction, current: str
 # ---------------- formatting ----------------
 def format_stock_embed():
     d = stock_data
-    embed = discord.Embed(title="📦 Stock Overview", color=discord.Color.blue())
+    embed = discord.Embed(title="📦 Marcos Gen • Stock Overview", color=discord.Color.blue())
     free_lines = []
     excl_lines = []
     for cat in d.get("categories", []):
@@ -130,7 +128,7 @@ def format_stock_embed():
         excl_lines.append(f"**{cat}** → {len(d.get('EXCLUSIVE', {}).get(cat, []))}")
     embed.add_field(name="🆓 Free Stock", value="\n".join(free_lines) or "No categories", inline=False)
     embed.add_field(name="💎 Exclusive Stock", value="\n".join(excl_lines) or "No categories", inline=False)
-    embed.set_footer(text="Automated • Marcos Gen")
+    embed.set_footer(text="Professional • Secure • Automated")
     return embed
 
 # ---------------- parsing helper (preserves ':') ----------------
@@ -180,7 +178,7 @@ async def boost_loop():
         except Exception:
             continue
 
-# ---------------- gen UI ----------------
+# ---------------- Gen UI ----------------
 class GenSelect(discord.ui.Select):
     def __init__(self, typ: str):
         opts = []
@@ -221,7 +219,7 @@ class GenSelect(discord.ui.Select):
                  f"Here is your item for now:\n```{item}```"),
                 ephemeral=True
             )
-        # staff log (best-effort)
+        # staff log
         try:
             staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
             await staff.send(f"[Generate] {interaction.user} ({interaction.user.id}) got item from {cat} ({self.typ})")
@@ -233,8 +231,8 @@ class GenView(discord.ui.View):
         super().__init__(timeout=60)
         self.add_item(GenSelect(typ))
 
-# ---------------- user commands ----------------
-@tree.command(name="gen", description="Generate a Free item")
+# ---------------- USER COMMANDS ----------------
+@tree.command(name="gen", description="Generate a Free item",)
 async def cmd_gen(interaction: discord.Interaction):
     await safe_load_stock()
     if not any(r.id == FREE_GEN_ROLE_ID for r in getattr(interaction.user, "roles", [])):
@@ -259,7 +257,7 @@ async def cmd_stock(interaction: discord.Interaction):
     embed = format_stock_embed()
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ---------------- admin commands ----------------
+# ---------------- ADMIN COMMANDS ----------------
 @tree.command(name="addcategory", description="Add a category (Admin only)")
 @is_admin_check()
 async def cmd_addcategory(interaction: discord.Interaction, category: str):
@@ -298,9 +296,6 @@ async def cmd_addstock(
     items: Optional[str] = None,
     file: Optional[discord.Attachment] = None
 ):
-    """
-    Use 'items' (paste multi-line or comma-separated list) OR attach a .txt file.
-    """
     await interaction.response.defer(ephemeral=True)
     t = stock_type.lower()
     if t not in ("free", "exclusive"):
@@ -497,7 +492,10 @@ async def cmd_resync(interaction: discord.Interaction):
         await interaction.followup.send("❌ Commands were resynced recently. Wait before running again to avoid rate limits.", ephemeral=True)
         return
     try:
-        guild_obj = discord.Object(id=GUILD_ID)
+        guild_obj = bot.get_guild(GUILD_ID)
+        if not guild_obj:
+            await interaction.followup.send("❌ Bot is not in the configured guild.", ephemeral=True)
+            return
         synced = await tree.sync(guild=guild_obj)
         _last_resync_ts = now_ts()
         await interaction.followup.send(f"✅ Commands synced to guild ({len(synced)} commands).", ephemeral=True)
@@ -591,7 +589,7 @@ async def on_member_remove(member: discord.Member):
                         pass
             break
 
-# ---------------- on_ready: populate invite cache, start loops, optionally sync ----------------
+# ---------------- on_ready: one-time HTTP clears + safe sync ----------------
 @bot.event
 async def on_ready():
     # populate invites cache
@@ -609,7 +607,6 @@ async def on_ready():
 
     # --- ONE-TIME: clear guild commands via HTTP (safe for mobile) ---
     try:
-        # only run once (marker file prevents repeats)
         if not os.path.exists(_CLEARED_MARKER):
             TOKEN = os.getenv("TOKEN")
             APP_ID = APPLICATION_ID
@@ -623,23 +620,54 @@ async def on_ready():
                         headers = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
                         async with session.put(url, json=[], headers=headers, timeout=20) as resp:
                             text = await resp.text()
-                            print(f"[CLEAR HTTP] status {resp.status}")
+                            print(f"[CLEAR HTTP - GUILD] status {resp.status}")
                             if resp.status in (200, 204):
-                                # create marker so we only do this once
                                 try:
                                     with open(_CLEARED_MARKER, "w", encoding="utf-8") as fh:
                                         fh.write(str(int(time.time())))
-                                    print("✅ One-time clear succeeded; marker file created.")
+                                    print("✅ One-time guild clear succeeded; marker file created.")
                                 except Exception as e:
-                                    print(f"[CLEAR ERROR] could not write marker file: {e}")
+                                    print(f"[CLEAR ERROR] could not write guild marker file: {e}")
                             else:
-                                print(f"[CLEAR ERROR] http {resp.status} body: {text}")
+                                print(f"[CLEAR ERROR] guild http {resp.status} body: {text}")
                 except Exception as e:
-                    print(f"[CLEAR ERROR] exception while calling API: {e}")
+                    print(f"[CLEAR ERROR] exception while calling guild API: {e}")
         else:
-            print("One-time clear already performed (marker found). Skipping HTTP clear.")
+            print("One-time guild clear already performed (marker found). Skipping guild HTTP clear.")
     except Exception as e:
         print(f"[CLEAR ERROR] unexpected: {e}")
+
+    # --- ONE-TIME: clear GLOBAL commands via HTTP if mismatch persists ---
+    try:
+        if not os.path.exists(_CLEARED_GLOBAL_MARKER):
+            TOKEN = os.getenv("TOKEN")
+            APP_ID = APPLICATION_ID
+            if not TOKEN:
+                print("[GLOBAL CLEAR ERROR] TOKEN env var not set; cannot clear global commands automatically.")
+            else:
+                url_global = f"https://discord.com/api/v10/applications/{APP_ID}/commands"
+                print("Attempting one-time GLOBAL command clear via HTTP...")
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        headers = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
+                        async with session.put(url_global, json=[], headers=headers, timeout=30) as resp:
+                            text = await resp.text()
+                            print(f"[CLEAR HTTP - GLOBAL] status {resp.status}")
+                            if resp.status in (200, 204):
+                                try:
+                                    with open(_CLEARED_GLOBAL_MARKER, "w", encoding="utf-8") as fh:
+                                        fh.write(str(int(time.time())))
+                                    print("✅ One-time global clear succeeded; marker file created.")
+                                except Exception as e:
+                                    print(f"[GLOBAL CLEAR ERROR] could not write global marker file: {e}")
+                            else:
+                                print(f"[GLOBAL CLEAR ERROR] http {resp.status} body: {text}")
+                except Exception as e:
+                    print(f"[GLOBAL CLEAR ERROR] exception while calling global API: {e}")
+        else:
+            print("One-time global clear already performed (marker found). Skipping global HTTP clear.")
+    except Exception as e:
+        print(f"[GLOBAL CLEAR ERROR] unexpected: {e}")
 
     # --- SYNC commands to the guild (safe sync) ---
     try:
