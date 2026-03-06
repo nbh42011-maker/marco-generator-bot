@@ -8,6 +8,7 @@ import os
 import json
 import time
 import asyncio
+import aiohttp
 from typing import Optional, List, Dict
 
 import discord
@@ -22,6 +23,11 @@ BOOST_ROLE_ID = 1453187878061478019
 ADMIN_ROLE_ID = 1452719764119093388
 STAFF_NOTIFY_USER_ID = 884084052854984726
 RESTOCK_CHANNEL_ID = 1478792670049599618
+# Application (client) id — set this to your app id
+APPLICATION_ID = "1478522023696273428"
+
+# One-time clear marker file (prevents repeated clears)
+_CLEARED_MARKER = "commands_cleared.lock"
 
 # Channels where plain user messages should be auto-deleted (no response)
 AUTODELETE_CHANNELS = {1478790217971273788, 1454503001363583019}
@@ -589,11 +595,11 @@ async def on_member_remove(member: discord.Member):
 @bot.event
 async def on_ready():
     # populate invites cache
-    for guild in bot.guilds:
+    for g in bot.guilds:
         try:
-            invites_cache[guild.id] = await guild.invites()
+            invites_cache[g.id] = await g.invites()
         except Exception:
-            invites_cache[guild.id] = []
+            invites_cache[g.id] = []
 
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
 
@@ -601,27 +607,55 @@ async def on_ready():
     if not boost_loop.is_running():
         boost_loop.start()
 
-    # ----- FIXED CLEAR + SYNC -----
+    # --- ONE-TIME: clear guild commands via HTTP (safe for mobile) ---
     try:
-        guild_obj = discord.Object(id=GUILD_ID)
-        if guild_obj:
-            # Clear existing guild commands first
-            await tree.clear_commands(guild=guild_obj)
-            print("✅ Cleared old guild commands")
-        synced = await tree.sync(guild=guild_obj)
-        print(f"✅ Commands synced to guild ({len(synced)} commands).")
+        # only run once (marker file prevents repeats)
+        if not os.path.exists(_CLEARED_MARKER):
+            TOKEN = os.getenv("TOKEN")
+            APP_ID = APPLICATION_ID
+            if not TOKEN:
+                print("[CLEAR ERROR] TOKEN env var not set; cannot clear commands automatically.")
+            else:
+                url = f"https://discord.com/api/v10/applications/{APP_ID}/guilds/{GUILD_ID}/commands"
+                print("Attempting one-time guild command clear via HTTP...")
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        headers = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
+                        async with session.put(url, json=[], headers=headers, timeout=20) as resp:
+                            text = await resp.text()
+                            print(f"[CLEAR HTTP] status {resp.status}")
+                            if resp.status in (200, 204):
+                                # create marker so we only do this once
+                                try:
+                                    with open(_CLEARED_MARKER, "w", encoding="utf-8") as fh:
+                                        fh.write(str(int(time.time())))
+                                    print("✅ One-time clear succeeded; marker file created.")
+                                except Exception as e:
+                                    print(f"[CLEAR ERROR] could not write marker file: {e}")
+                            else:
+                                print(f"[CLEAR ERROR] http {resp.status} body: {text}")
+                except Exception as e:
+                    print(f"[CLEAR ERROR] exception while calling API: {e}")
+        else:
+            print("One-time clear already performed (marker found). Skipping HTTP clear.")
     except Exception as e:
-        print(f"[SYNC ERROR] {e}")
+        print(f"[CLEAR ERROR] unexpected: {e}")
 
-    # Optional one-time global sync (disable after first run)
-    if SYNC_ON_START:
-        try:
-            all_synced = await tree.sync()
-            print(f"[SYNC_ON_START] global sync: {len(all_synced)} commands")
-        except Exception as e:
-            print(f"[SYNC_ON_START ERROR] {e}")
+    # --- SYNC commands to the guild (safe sync) ---
+    try:
+        guild = bot.get_guild(GUILD_ID)
+        if guild is None:
+            print(f"[SYNC ERROR] Guild {GUILD_ID} not present in bot.guilds. Skipping guild sync.")
+        else:
+            try:
+                synced = await tree.sync(guild=guild)
+                print(f"✅ Commands synced to guild ({len(synced)} commands).")
+            except Exception as e:
+                print(f"[SYNC ERROR] when syncing to guild: {e}")
+    except Exception as e:
+        print(f"[SYNC ERROR] unexpected: {e}")
 
-    # Optional extra one-time automatic sync (disabled by default); keep OFF once working to avoid rate-limits.
+    # Optional one-time global sync (only if SYNC_ON_START true)
     if SYNC_ON_START:
         try:
             all_synced = await tree.sync()
