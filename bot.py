@@ -51,7 +51,9 @@ intents.members = True
 intents.message_content = True
 intents.presences = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+# Provide application_id to ensure proper command registration behavior
+_app_id_int = int(APPLICATION_ID) if APPLICATION_ID and APPLICATION_ID.isdigit() else None
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None, application_id=_app_id_int)
 tree = bot.tree
 GUILD_OBJ = discord.Object(id=GUILD_ID)
 
@@ -930,41 +932,35 @@ async def global_appcmd_error(interaction: discord.Interaction, error: app_comma
     except Exception:
         pass
 
-# ---------------- on_ready: one-time HTTP clears + sync ----------------
+# ---------------- on_ready: start loops + robust sync ----------------
 @bot.event
 async def on_ready():
     # start boost loop
-    if not boost_loop.is_running():
-        boost_loop.start()
+    try:
+        if not boost_loop.is_running():
+            boost_loop.start()
+    except Exception as e:
+        print(f"[BOOST LOOP ERROR] {e}")
 
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
 
-    # One-time guild clear via HTTP (best-effort) - keeps original behaviour
-    try:
-        if not os.path.exists(_CLEARED_MARKER):
-            TOKEN = os.getenv("TOKEN")
-            APP_ID = APPLICATION_ID
-            if TOKEN:
-                url = f"https://discord.com/api/v10/applications/{APP_ID}/guilds/{GUILD_ID}/commands"
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        headers = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
-                        async with session.put(url, json=[], headers=headers, timeout=20) as resp:
-                            if resp.status in (200, 204):
-                                with open(_CLEARED_MARKER, "w", encoding="utf-8") as fh:
-                                    fh.write(str(int(now_ts())))
-                                print("✅ One-time guild clear succeeded; marker file created.")
-                            else:
-                                text = await resp.text()
-                                print(f"[CLEAR HTTP] status {resp.status} body: {text[:400]}")
-                except Exception as e:
-                    print(f"[CLEAR ERROR] {e}")
-            else:
-                print("[CLEAR ERROR] TOKEN not set; skipping HTTP clear.")
+    # IMPORTANT: Do NOT clear commands via HTTP by default.
+    # If you need to clear commands, set env var DO_HTTP_CLEAR=1 (use carefully).
+    if os.getenv("DO_HTTP_CLEAR", "0") == "1":
+        TOKEN = os.getenv("TOKEN")
+        APP_ID = APPLICATION_ID
+        if TOKEN and APP_ID:
+            url = f"https://discord.com/api/v10/applications/{APP_ID}/guilds/{GUILD_ID}/commands"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    headers = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
+                    async with session.put(url, json=[], headers=headers, timeout=20) as resp:
+                        text = await resp.text()
+                        print(f"[HTTP CLEAR] status {resp.status} body: {text[:400]}")
+            except Exception as e:
+                print(f"[HTTP CLEAR ERROR] {e}")
         else:
-            print("One-time guild clear already performed; skipping.")
-    except Exception as e:
-        print(f"[CLEAR ERROR] unexpected: {e}")
+            print("[HTTP CLEAR] TOKEN or APP_ID missing; skipping.")
 
     # Sync to guild (scoped) - robust & prints results so you can see registration
     try:
@@ -977,7 +973,7 @@ async def on_ready():
     except Exception as e:
         print(f"[SYNC ERROR] {e}")
 
-    # Optional global sync
+    # Optional global sync if explicitly enabled
     if SYNC_ON_START:
         try:
             all_synced = await tree.sync()
