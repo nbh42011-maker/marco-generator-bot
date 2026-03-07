@@ -1,50 +1,51 @@
-# bot.py — Updated: vouch behavior configurable (default: NO vouch on !freegenrole)
+# bot.py — Full working generator bot (stock + invites + vouches + safe sync)
 # Requirements: discord.py, aiohttp
-# Env: TOKEN must be set
+# Set TOKEN in env. Optional: SYNC_ON_START=1 to globally sync once.
 
 import os
 import json
 import time
 import asyncio
-from typing import Optional, List, Dict, Set
+from typing import Optional, List, Dict
 
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-# ---------------- CONFIG ----------------
-GUILD_ID = 1452717489656954961          # your server id (int)
-APPLICATION_ID = "1478522023696273428"  # app/client id (string)
+# ---------------- CONFIG (change IDs if needed) ----------------
+GUILD_ID = 1452717489656954961          # Your server ID
+APPLICATION_ID = "1478522023696273428"  # Client/App ID string
+TOKEN_ENV_NAME = "TOKEN"                # env var name
 
-FREE_GEN_ROLE_ID = 1467913996723032315
+FREE_GEN_ROLE_ID = 1467913996723032315  # FreeGen role
 EXCLUSIVE_ROLE_ID = 1453906576237924603
 BOOST_ROLE_ID = 1453187878061478019
 ADMIN_ROLE_ID = 1452719764119093388
 STAFF_NOTIFY_USER_ID = 884084052854984726
-RESTOCK_CHANNEL_ID = 1478792670049599618
 
+RESTOCK_CHANNEL_ID = 1478792670049599618  # channel for restock pings
+
+# <-- VOUCH CHANNEL UPDATED TO THE ID YOU GAVE
+VOUCH_CHANNEL_ID = 1452868333383716915    # vouch posts go here
+
+# Channels where plain user messages should be auto-deleted
 AUTODELETE_CHANNELS = {1478790217971273788, 1454503001363583019}
 
-# VOUCH config (these are the staff who may vouch)
-VOUCH_REQUIRED_USERS = {884084052854984726, 1469703951166210223}
-VOUCH_CHANNEL_ID = 1452868333383716915
-VOUCH_TIMEOUT_SECONDS = 60 * 5  # 5 minutes
-
 STOCK_FILE = "stock.json"
+VOUCH_FILE = "vouches.json"
 
-FREE_COOLDOWN = 180
-EXCL_COOLDOWN = 60
-RESYNC_COOLDOWN = 60 * 60
-
+# One-time clear markers (avoid repeating dangerous clears)
 _CLEARED_MARKER = "commands_cleared.lock"
 _CLEARED_GLOBAL_MARKER = "commands_cleared_global.lock"
 
-SYNC_ON_START = os.getenv("SYNC_ON_START", "0") == "1"
+# cooldowns (seconds)
+FREE_COOLDOWN = 180
+EXCL_COOLDOWN = 60
+RESYNC_COOLDOWN = 60 * 60  # 1 hour between manual resyncs
 
-# NEW FLAG: if False, !freegenrole grants role immediately and NO vouch timer.
-# If True, the bot will grant role and start the 5-minute vouch watch (requires both staff to vouch).
-REQUIRE_VOUCH_FOR_FREEGEN = False
+# Optional: if set to "1" the bot will attempt a one-time global sync on_ready (keep OFF normally)
+SYNC_ON_START = os.getenv("SYNC_ON_START", "0") == "1"
 
 # ---------------- INTENTS & BOT ----------------
 intents = discord.Intents.default()
@@ -55,40 +56,59 @@ intents.presences = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 tree = bot.tree
 
-# ---------------- STORAGE & LOCK ----------------
+# ---------------- storage & lock ----------------
 _file_lock = asyncio.Lock()
+_vouch_lock = asyncio.Lock()
 
-def _ensure_stock_file():
-    if not os.path.exists(STOCK_FILE):
-        with open(STOCK_FILE, "w", encoding="utf-8") as f:
-            json.dump({"FREE": {}, "EXCLUSIVE": {}, "categories": []}, f, indent=4)
+def _ensure_file(path: str, default):
+    if not os.path.exists(path):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(default, f, indent=4)
+        except Exception:
+            pass
 
-def _load_stock_from_disk() -> Dict:
-    _ensure_stock_file()
-    with open(STOCK_FILE, "r", encoding="utf-8") as f:
+def _load_json(path: str):
+    _ensure_file(path, {})
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def _save_stock_to_disk(data: Dict):
-    with open(STOCK_FILE, "w", encoding="utf-8") as f:
+def _save_json(path: str, data):
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
-stock_data = _load_stock_from_disk()
+# ensure files exist
+_ensure_file(STOCK_FILE, {"FREE": {}, "EXCLUSIVE": {}, "categories": []})
+_ensure_file(VOUCH_FILE, {"vouches": []})
+
+stock_data = _load_json(STOCK_FILE)
+vouch_data = _load_json(VOUCH_FILE)
 
 async def safe_load_stock():
     global stock_data
     async with _file_lock:
-        stock_data = _load_stock_from_disk()
+        stock_data = _load_json(STOCK_FILE)
         return stock_data
 
 async def safe_save_stock():
     async with _file_lock:
-        _save_stock_to_disk(stock_data)
+        _save_json(STOCK_FILE, stock_data)
 
-# ---------------- cooldowns/resync guard ----------------
-_cooldowns = {}  # {(user_id, "FREE"|"EXCLUSIVE"): timestamp}
+async def safe_load_vouches():
+    global vouch_data
+    async with _vouch_lock:
+        vouch_data = _load_json(VOUCH_FILE)
+        return vouch_data
+
+async def safe_save_vouches():
+    async with _vouch_lock:
+        _save_json(VOUCH_FILE, vouch_data)
+
+# ---------------- cooldowns / resync guard ----------------
+_cooldowns: Dict = {}
 _last_resync_ts = 0
 
-def now_ts():
+def now_ts() -> float:
     return time.time()
 
 def check_cooldown(user_id: int, typ: str) -> int:
@@ -101,29 +121,27 @@ def check_cooldown(user_id: int, typ: str) -> int:
 def set_cooldown(user_id: int, typ: str):
     _cooldowns[(user_id, typ)] = now_ts()
 
-# ---------------- admin check helper ----------------
+# ---------------- admin-check helper ----------------
 def is_admin_check():
     async def predicate(interaction: discord.Interaction) -> bool:
         user = interaction.user
-        if not hasattr(user, "roles"):
-            return False
         return any(r.id == ADMIN_ROLE_ID for r in getattr(user, "roles", []))
     return app_commands.check(predicate)
 
-# ---------------- autocomplete ----------------
+# ---------------- autocomplete helpers ----------------
 async def category_autocomplete(interaction: discord.Interaction, current: str):
     await safe_load_stock()
     cats = stock_data.get("categories", [])
     return [app_commands.Choice(name=c, value=c) for c in cats if current.lower() in c.lower()][:25]
 
-async def type_autocomplete(interaction: discord.Interaction, current: str):
+async def stock_type_autocomplete(interaction: discord.Interaction, current: str):
     opts = ["free", "exclusive"]
     return [app_commands.Choice(name=o.capitalize(), value=o) for o in opts if current.lower() in o.lower()][:25]
 
-# ---------------- util / formatting ----------------
+# ---------------- formatting ----------------
 def format_stock_embed():
     d = stock_data
-    embed = discord.Embed(title="📦 Marcos Gen • Stock Overview", color=discord.Color.blue())
+    embed = discord.Embed(title="📦 Stock Overview", color=discord.Color.blue())
     free_lines = []
     excl_lines = []
     for cat in d.get("categories", []):
@@ -131,9 +149,10 @@ def format_stock_embed():
         excl_lines.append(f"**{cat}** → {len(d.get('EXCLUSIVE', {}).get(cat, []))}")
     embed.add_field(name="🆓 Free Stock", value="\n".join(free_lines) or "No categories", inline=False)
     embed.add_field(name="💎 Exclusive Stock", value="\n".join(excl_lines) or "No categories", inline=False)
-    embed.set_footer(text="Professional • Secure • Automated")
+    embed.set_footer(text="Automated • Marcos Gen")
     return embed
 
+# ---------------- parsing helper (preserves ':') ----------------
 def parse_items_from_text(text: str) -> List[str]:
     if not text:
         return []
@@ -146,40 +165,11 @@ def parse_items_from_text(text: str) -> List[str]:
         lines = [text]
     return lines
 
-# ---------------- vouch state (used only if REQUIRE_VOUCH_FOR_FREEGEN=True) ----------------
-pending_vouches: Dict[int, Dict] = {}  # user_id -> {expires, vouchers:set, task}
+# ---------------- invite tracking ----------------
+invites_cache: Dict[int, List[discord.Invite]] = {}
+invite_tracker: Dict[int, Dict[int, int]] = {}  # guild_id -> {inviter_id: count}
 
-def _make_vouch_task(user_id: int):
-    async def waiter():
-        await asyncio.sleep(VOUCH_TIMEOUT_SECONDS)
-        if pending_vouches.get(user_id):
-            await _expire_vouch_request(user_id)
-    return asyncio.create_task(waiter())
-
-async def _expire_vouch_request(user_id: int):
-    pending = pending_vouches.get(user_id)
-    if not pending:
-        return
-    guild = bot.get_guild(GUILD_ID)
-    if guild:
-        member = guild.get_member(user_id)
-        if member:
-            role = guild.get_role(FREE_GEN_ROLE_ID)
-            if role and role in member.roles:
-                try:
-                    await member.remove_roles(role)
-                except Exception:
-                    pass
-            try:
-                await member.send(
-                    ("⏳ Verification timed out — both staff members did not vouch within the time window.\n\n"
-                     "Your Free Gen role was removed. To appeal, open a ticket or contact staff.")
-                )
-            except Exception:
-                pass
-    pending_vouches.pop(user_id, None)
-
-# ---------------- background loops ----------------
+# ---------------- background loops (start in on_ready) ----------------
 @tasks.loop(minutes=5)
 async def boost_loop():
     guild = bot.get_guild(GUILD_ID)
@@ -202,7 +192,7 @@ async def boost_loop():
         except Exception:
             continue
 
-# ---------------- Gen UI ----------------
+# ---------------- gen UI ----------------
 class GenSelect(discord.ui.Select):
     def __init__(self, typ: str):
         opts = []
@@ -231,7 +221,7 @@ class GenSelect(discord.ui.Select):
 
         dm_ok = True
         try:
-            await interaction.user.send(f"🎉 Here is your item from {cat}:\n```{item}```")
+            await interaction.user.send(f"{'💎' if self.typ == 'EXCLUSIVE' else '🎉'} **Here is your item from {cat}:**\n```{item}```")
         except Exception:
             dm_ok = False
 
@@ -239,86 +229,150 @@ class GenSelect(discord.ui.Select):
             await interaction.followup.send("✅ Sent to your DMs.", ephemeral=True)
         else:
             await interaction.followup.send(
-                ("⚠️ Could not send DM. Please enable DMs from server members.\n\n"
+                ("⚠️ Could not send DM. Please enable DMs from server members or accept direct messages.\n\n"
                  f"Here is your item for now:\n```{item}```"),
                 ephemeral=True
             )
+        # staff log
+        try:
+            staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
+            await staff.send(f"[Generate] {interaction.user} ({interaction.user.id}) got item from {cat} ({self.typ})")
+        except Exception:
+            pass
 
 class GenView(discord.ui.View):
     def __init__(self, typ: str):
         super().__init__(timeout=60)
         self.add_item(GenSelect(typ))
 
-# ---------------- USER COMMANDS (guild-scoped) ----------------
-GUILD_OBJ = discord.Object(id=GUILD_ID)
-
-@tree.command(name="gen", description="Generate a Free item", guild=GUILD_OBJ)
+# ---------------- USER COMMANDS ----------------
+@tree.command(name="gen", description="Generate a Free item")
 async def cmd_gen(interaction: discord.Interaction):
     await safe_load_stock()
-    member_roles = [r.id for r in getattr(interaction.user, "roles", [])]
-    if FREE_GEN_ROLE_ID not in member_roles:
+    if not any(r.id == FREE_GEN_ROLE_ID for r in getattr(interaction.user, "roles", [])):
         await interaction.response.send_message(
-            ("❌ Free Gen access requires the FreeGen role. Type `!freegenrole` to request it."), ephemeral=True
+            ("❌ Free Gen access requires the FreeGen role. You can earn it by inviting friends — run `/invites` to see your progress."),
+            ephemeral=True
         )
         return
     await interaction.response.send_message("📦 Select a Free category:", view=GenView("FREE"), ephemeral=True)
 
-@tree.command(name="exclusive-gen", description="Generate an Exclusive item", guild=GUILD_OBJ)
+@tree.command(name="exclusive-gen", description="Generate an Exclusive item")
 async def cmd_exclusive_gen(interaction: discord.Interaction):
-    # Exclusive never requires vouch
+    # Exclusive access requires the Exclusive role ONLY — vouches are NOT required to use exclusive commands.
     if EXCLUSIVE_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
         await interaction.response.send_message("❌ You need the Exclusive role to use this command.", ephemeral=True)
         return
     await safe_load_stock()
     await interaction.response.send_message("💎 Select an Exclusive category:", view=GenView("EXCLUSIVE"), ephemeral=True)
 
-@tree.command(name="stock", description="View current stock", guild=GUILD_OBJ)
+@tree.command(name="stock", description="View current stock")
 async def cmd_stock(interaction: discord.Interaction):
     await safe_load_stock()
     embed = format_stock_embed()
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ---------------- ADMIN COMMANDS ----------------
-@tree.command(name="addcategory", description="Add a category (Admin only)", guild=GUILD_OBJ)
+# ---------------- ADMIN COMMANDS (category with scope) ----------------
+@app_commands.choices(
+    scope=[
+        app_commands.Choice(name="Free", value="free"),
+        app_commands.Choice(name="Exclusive", value="exclusive"),
+        app_commands.Choice(name="Both", value="both"),
+    ]
+)
+@tree.command(name="addcategory", description="Add a category (Admin only). Choose Free, Exclusive, or Both.")
 @is_admin_check()
-async def cmd_addcategory(interaction: discord.Interaction, category: str):
+async def cmd_addcategory(interaction: discord.Interaction, category: str, scope: str):
     await interaction.response.defer(ephemeral=True)
     await safe_load_stock()
-    if category in stock_data.get("categories", []):
-        await interaction.followup.send("❌ Category already exists.", ephemeral=True)
-        return
-    stock_data.setdefault("categories", []).append(category)
-    stock_data.setdefault("FREE", {})[category] = []
-    stock_data.setdefault("EXCLUSIVE", {})[category] = []
-    await safe_save_stock()
-    await interaction.followup.send(f"✅ Category `{category}` added.", ephemeral=True)
 
-@tree.command(name="removecategory", description="Remove a category (Admin only)", guild=GUILD_OBJ)
+    category = category.strip()
+    if not category:
+        await interaction.followup.send("❌ Category cannot be empty.", ephemeral=True)
+        return
+
+    existed = category in stock_data.get("categories", [])
+    responses = []
+
+    if not existed:
+        stock_data.setdefault("categories", []).append(category)
+        responses.append(f"Added `{category}` to master categories list.")
+
+    if scope in ("free", "both"):
+        if category not in stock_data.setdefault("FREE", {}):
+            stock_data["FREE"][category] = []
+            responses.append("Added to Free stock.")
+        else:
+            responses.append("Already present in Free stock.")
+
+    if scope in ("exclusive", "both"):
+        if category not in stock_data.setdefault("EXCLUSIVE", {}):
+            stock_data["EXCLUSIVE"][category] = []
+            responses.append("Added to Exclusive stock.")
+        else:
+            responses.append("Already present in Exclusive stock.")
+
+    await safe_save_stock()
+    await interaction.followup.send("✅ " + " ".join(responses), ephemeral=True)
+
+@app_commands.choices(
+    scope=[
+        app_commands.Choice(name="Free", value="free"),
+        app_commands.Choice(name="Exclusive", value="exclusive"),
+        app_commands.Choice(name="Both", value="both"),
+    ]
+)
+@tree.command(name="removecategory", description="Remove a category (Admin only). Choose Free, Exclusive, or Both.")
 @is_admin_check()
-async def cmd_removecategory(interaction: discord.Interaction, category: str):
+async def cmd_removecategory(interaction: discord.Interaction, category: str, scope: str):
     await interaction.response.defer(ephemeral=True)
     await safe_load_stock()
+
+    category = category.strip()
     if category not in stock_data.get("categories", []):
-        await interaction.followup.send("❌ Category does not exist.", ephemeral=True)
-        return
-    stock_data["categories"].remove(category)
-    stock_data["FREE"].pop(category, None)
-    stock_data["EXCLUSIVE"].pop(category, None)
-    await safe_save_stock()
-    await interaction.followup.send(f"✅ Category `{category}` removed.", ephemeral=True)
+        warning = True
+    else:
+        warning = False
 
-@tree.command(name="addstock", description="Add stock (Admin only). Provide text or attach a .txt file", guild=GUILD_OBJ)
+    removed_msgs = []
+
+    if scope in ("free", "both"):
+        if category in stock_data.get("FREE", {}):
+            stock_data["FREE"].pop(category, None)
+            removed_msgs.append("Removed from Free stock.")
+        else:
+            removed_msgs.append("Not found in Free stock.")
+
+    if scope in ("exclusive", "both"):
+        if category in stock_data.get("EXCLUSIVE", {}):
+            stock_data["EXCLUSIVE"].pop(category, None)
+            removed_msgs.append("Removed from Exclusive stock.")
+        else:
+            removed_msgs.append("Not found in Exclusive stock.")
+
+    if scope == "both":
+        if category in stock_data.get("categories", []):
+            stock_data["categories"].remove(category)
+            removed_msgs.append("Removed from master categories list.")
+
+    await safe_save_stock()
+
+    reply = ("⚠️ Category not present in master list. " if warning else "") + " ".join(removed_msgs)
+    await interaction.followup.send(f"✅ {reply}", ephemeral=True)
+
+# ---------------- addstock / removestock / restock ----------------
+@tree.command(name="addstock", description="Add stock (Admin only). Provide text or attach a .txt file")
 @is_admin_check()
-@app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
+@app_commands.autocomplete(stock_type=stock_type_autocomplete, category=category_autocomplete)
 async def cmd_addstock(
     interaction: discord.Interaction,
-    type: str,
+    stock_type: str,
     category: str,
-    stock: Optional[str] = None,
+    items: Optional[str] = None,
     file: Optional[discord.Attachment] = None
 ):
     await interaction.response.defer(ephemeral=True)
-    t = type.lower()
+    t = stock_type.lower()
     if t not in ("free", "exclusive"):
         await interaction.followup.send("❌ Type must be `free` or `exclusive`.", ephemeral=True)
         return
@@ -340,37 +394,39 @@ async def cmd_addstock(
         for line in lines:
             if line not in stock_data[key].get(category, []):
                 new_items.append(line)
-    elif stock:
-        lines = parse_items_from_text(stock)
+    elif items:
+        lines = parse_items_from_text(items)
         for line in lines:
             if line not in stock_data[key].get(category, []):
                 new_items.append(line)
     else:
-        await interaction.followup.send("❌ Provide stock text (one per line) in the **stock** field or attach a .txt file.", ephemeral=True)
+        await interaction.followup.send("❌ Provide stock text (one per line) in the **items** field or attach a .txt file.", ephemeral=True)
         return
 
     stock_data[key].setdefault(category, []).extend(new_items)
     await safe_save_stock()
-    await interaction.followup.send(f"✅ Added {len(new_items)} item(s) to {category}.", ephemeral=True)
+    await interaction.followup.send(f"✅ Added {len(new_items)} item(s) to `{category}`.", ephemeral=True)
 
     restock_channel = bot.get_channel(RESTOCK_CHANNEL_ID) or (interaction.guild.get_channel(RESTOCK_CHANNEL_ID) if interaction.guild else None)
     role_id = FREE_GEN_ROLE_ID if key == "FREE" else EXCLUSIVE_ROLE_ID
-    if restock_channel:
+    if restock_channel and new_items:
         try:
-            await restock_channel.send(f"<@&{role_id}> 🔔 {category} was restocked — {len(new_items)} new items.")
+            await restock_channel.send(f"<@&{role_id}> 🔔 `{category}` was restocked ({len(new_items)} new item(s)).")
         except Exception:
             pass
 
-@tree.command(name="removestock", description="Clear stock for a type+category (Admin only)", guild=GUILD_OBJ)
+@tree.command(name="removestock", description="Remove stock items (Admin only). Provide text or attach .txt")
 @is_admin_check()
-@app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
+@app_commands.autocomplete(stock_type=stock_type_autocomplete, category=category_autocomplete)
 async def cmd_removestock(
     interaction: discord.Interaction,
-    type: str,
-    category: str
+    stock_type: str,
+    category: str,
+    items: Optional[str] = None,
+    file: Optional[discord.Attachment] = None
 ):
     await interaction.response.defer(ephemeral=True)
-    t = type.lower()
+    t = stock_type.lower()
     if t not in ("free", "exclusive"):
         await interaction.followup.send("❌ Type must be `free` or `exclusive`.", ephemeral=True)
         return
@@ -380,31 +436,44 @@ async def cmd_removestock(
         await interaction.followup.send("❌ Invalid category.", ephemeral=True)
         return
 
-    removed_count = len(stock_data.get(key, {}).get(category, []))
-    stock_data[key][category] = []
-    await safe_save_stock()
-    await interaction.followup.send(f"✅ Cleared {removed_count} item(s) from {category}.", ephemeral=True)
-
-    restock_channel = bot.get_channel(RESTOCK_CHANNEL_ID) or (interaction.guild.get_channel(RESTOCK_CHANNEL_ID) if interaction.guild else None)
-    role_id = FREE_GEN_ROLE_ID if key == "FREE" else EXCLUSIVE_ROLE_ID
-    if restock_channel:
+    removed = 0
+    if file:
         try:
-            await restock_channel.send(f"<@&{role_id}> 🗑️ {category} has been cleared.")
+            raw = await file.read()
+            text = raw.decode(errors="ignore")
+            lines = parse_items_from_text(text)
         except Exception:
-            pass
+            await interaction.followup.send("❌ Could not read attached file. Use a plain .txt.", ephemeral=True)
+            return
+        for line in lines:
+            while line in stock_data[key].get(category, []):
+                stock_data[key][category].remove(line)
+                removed += 1
+    elif items:
+        lines = parse_items_from_text(items)
+        for line in lines:
+            while line in stock_data[key].get(category, []):
+                stock_data[key][category].remove(line)
+                removed += 1
+    else:
+        await interaction.followup.send("❌ Provide items to remove as text or attach a .txt file.", ephemeral=True)
+        return
 
-@tree.command(name="restock", description="Replace stock for a category (Admin only)", guild=GUILD_OBJ)
+    await safe_save_stock()
+    await interaction.followup.send(f"✅ Removed {removed} item(s) from `{category}`.", ephemeral=True)
+
+@tree.command(name="restock", description="Replace stock for a category (Admin only)")
 @is_admin_check()
-@app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
+@app_commands.autocomplete(stock_type=stock_type_autocomplete, category=category_autocomplete)
 async def cmd_restock(
     interaction: discord.Interaction,
-    type: str,
+    stock_type: str,
     category: str,
-    stock: Optional[str] = None,
+    items: Optional[str] = None,
     file: Optional[discord.Attachment] = None
 ):
     await interaction.response.defer(ephemeral=True)
-    t = type.lower()
+    t = stock_type.lower()
     if t not in ("free", "exclusive"):
         await interaction.followup.send("❌ Type must be `free` or `exclusive`.", ephemeral=True)
         return
@@ -424,8 +493,8 @@ async def cmd_restock(
         except Exception:
             await interaction.followup.send("❌ Could not read attached file. Use a plain .txt.", ephemeral=True)
             return
-    elif stock:
-        lines = parse_items_from_text(stock)
+    elif items:
+        lines = parse_items_from_text(items)
         new_items = list(dict.fromkeys(lines))
     else:
         await interaction.followup.send("❌ Provide stock text or attach a .txt file.", ephemeral=True)
@@ -433,17 +502,92 @@ async def cmd_restock(
 
     stock_data[key][category] = new_items
     await safe_save_stock()
-    await interaction.followup.send(f"♻️ {category} fully restocked — {len(new_items)} item(s).", ephemeral=True)
+    await interaction.followup.send(f"♻️ `{category}` fully restocked with {len(new_items)} item(s).", ephemeral=True)
 
     restock_channel = bot.get_channel(RESTOCK_CHANNEL_ID) or (interaction.guild.get_channel(RESTOCK_CHANNEL_ID) if interaction.guild else None)
     role_id = FREE_GEN_ROLE_ID if key == "FREE" else EXCLUSIVE_ROLE_ID
     if restock_channel:
         try:
-            await restock_channel.send(f"<@&{role_id}> 🚀 {category} fully restocked — {len(new_items)} items.")
+            await restock_channel.send(f"<@&{role_id}> 🚀 `{category}` fully restocked with {len(new_items)} item(s).")
         except Exception:
             pass
 
-# ---------------- REDEEM ----------------
+# ---------------- vouch system ----------------
+@tree.command(name="vouch", description="Post a vouch to the vouch channel (Admin only)")
+@is_admin_check()
+@app_commands.choices(rating=[app_commands.Choice(name=str(i), value=i) for i in range(1,6)])
+async def cmd_vouch(interaction: discord.Interaction, username: str, rating: int, reason: str):
+    """
+    Admins post a vouch: username (string), rating (1-5), reason (string).
+    Vouches are recorded in vouches.json and posted to VOUCH_CHANNEL_ID.
+    IMPORTANT: Vouches do NOT auto-grant roles. Exclusive users do NOT need to vouch.
+    """
+    await interaction.response.defer(ephemeral=True)
+    embed = discord.Embed(title="🆕 New Vouch", color=discord.Color.green(), timestamp=discord.utils.utcnow())
+    embed.add_field(name="User", value=username, inline=True)
+    embed.add_field(name="Rating", value=f"{'⭐'*rating} ({rating}/5)", inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.set_footer(text=f"Vouched by {interaction.user} • ID: {interaction.user.id}")
+
+    vouch_channel = bot.get_channel(VOUCH_CHANNEL_ID) or (interaction.guild.get_channel(VOUCH_CHANNEL_ID) if interaction.guild else None)
+    try:
+        if vouch_channel:
+            await vouch_channel.send(embed=embed)
+    except Exception:
+        pass
+
+    await safe_load_vouches()
+    entry = {
+        "username": username,
+        "rating": rating,
+        "reason": reason,
+        "vouched_by": f"{interaction.user} ({interaction.user.id})",
+        "timestamp": int(time.time())
+    }
+    vouch_data.setdefault("vouches", []).insert(0, entry)
+    vouch_data["vouches"] = vouch_data["vouches"][:500]
+    await safe_save_vouches()
+
+    await interaction.followup.send("✅ Vouch posted and saved.", ephemeral=True)
+
+@tree.command(name="vouch-list", description="Show the most recent vouches (Admin only)")
+@is_admin_check()
+async def cmd_vouch_list(interaction: discord.Interaction, limit: Optional[int] = 5):
+    await interaction.response.defer(ephemeral=True)
+    await safe_load_vouches()
+    vouches = vouch_data.get("vouches", [])[:limit]
+    if not vouches:
+        await interaction.followup.send("No vouches found.", ephemeral=True)
+        return
+    lines = []
+    for v in vouches:
+        t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(v["timestamp"]))
+        lines.append(f"**{v['username']}** — {v['rating']}/5 — {v['reason'][:80]} — {t}")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+# ---------------- invites (replaces /verify) ----------------
+@tree.command(name="invites", description="See progress toward Free Gen role (5 invites required)")
+async def cmd_invites(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("This command must be used in a server.", ephemeral=True)
+        return
+    inviter_id = interaction.user.id
+    count = invite_tracker.get(guild.id, {}).get(inviter_id, 0)
+    needed = max(0, 5 - count)
+    embed = discord.Embed(
+        title="🎯 Free Gen Invite Progress",
+        description=(f"Invite friends to earn the Free Gen role — it's quick and totally free!\n\n"
+                     f"**Your progress:** {count} invite(s)\n"
+                     f"**Remaining to earn role:** {needed}\n\n"
+                     "When you reach 5 invites you'll automatically receive the Free Gen role. Keep sharing the invite link!"),
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="Invites tracked while bot is online — counts are best-effort.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# ---------------- redeem modal ----------------
 class RedeemModal(discord.ui.Modal, title="Redeem Exclusive Gift Card"):
     payment_type = discord.ui.TextInput(label="Payment Type", placeholder="e.g. PayPal, CashApp, Gift Card")
     code = discord.ui.TextInput(label="Redeem Code", placeholder="Paste the redeem code here")
@@ -460,12 +604,12 @@ class RedeemModal(discord.ui.Modal, title="Redeem Exclusive Gift Card"):
             pass
         await interaction.followup.send("✅ Your code has been submitted for verification. Staff will review shortly.", ephemeral=True)
 
-@tree.command(name="redeem-exclusive", description="Redeem Exclusive access via gift card", guild=GUILD_OBJ)
+@tree.command(name="redeem-exclusive", description="Redeem Exclusive access via gift card")
 async def cmd_redeem(interaction: discord.Interaction):
     await interaction.response.send_modal(RedeemModal())
 
-# ---------------- RESYNC ----------------
-@tree.command(name="resync-commands", description="(Admin) Register/sync commands to the guild", guild=GUILD_OBJ)
+# ---------------- resync (admin, guarded) ----------------
+@tree.command(name="resync-commands", description="(Admin) Register/sync commands to the guild (use only if needed)")
 @is_admin_check()
 async def cmd_resync(interaction: discord.Interaction):
     global _last_resync_ts
@@ -475,22 +619,22 @@ async def cmd_resync(interaction: discord.Interaction):
         await interaction.followup.send("❌ Commands were resynced recently. Wait before running again to avoid rate limits.", ephemeral=True)
         return
     try:
-        guild_obj = bot.get_guild(GUILD_ID)
-        if not guild_obj:
-            await interaction.followup.send("❌ Bot is not in the configured guild.", ephemeral=True)
+        guild = bot.get_guild(GUILD_ID)
+        if guild is None:
+            await interaction.followup.send("❌ Bot not in configured guild. Cannot resync.", ephemeral=True)
             return
-        synced = await tree.sync(guild=guild_obj)
+        synced = await tree.sync(guild=guild)
         _last_resync_ts = now_ts()
         await interaction.followup.send(f"✅ Commands synced to guild ({len(synced)} commands).", ephemeral=True)
     except discord.Forbidden:
-        await interaction.followup.send("❌ Missing access when syncing commands. Ensure bot has applications.commands scope & is in guild.", ephemeral=True)
+        await interaction.followup.send("❌ Missing permissions when syncing commands. Ensure bot has applications.commands scope & is in guild.", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
 
-# ---------------- global app command error ----------------
+# ---------------- global app command error handler ----------------
 @bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingRole):
+async def global_appcmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingRole) or isinstance(error, app_commands.CheckFailure):
         try:
             if not interaction.response.is_done():
                 await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
@@ -516,25 +660,80 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     except Exception:
         pass
 
+# ---------------- invite events ----------------
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+    old_invites = invites_cache.get(guild.id, [])
+    try:
+        new_invites = await guild.invites()
+    except Exception:
+        invites_cache[guild.id] = old_invites
+        return
+
+    inviter = None
+    for invite in new_invites:
+        matched = next((old for old in old_invites if old.code == invite.code), None)
+        if matched and invite.uses > matched.uses:
+            inviter = invite.inviter
+            break
+
+    invites_cache[guild.id] = new_invites
+
+    if inviter:
+        invite_tracker.setdefault(guild.id, {})
+        invite_tracker[guild.id].setdefault(inviter.id, 0)
+        invite_tracker[guild.id][inviter.id] += 1
+
+        # Grant role at 5 invites
+        if invite_tracker[guild.id][inviter.id] >= 5:
+            role = guild.get_role(FREE_GEN_ROLE_ID)
+            user = guild.get_member(inviter.id)
+            if role and user:
+                try:
+                    await user.add_roles(role)
+                except Exception:
+                    pass
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    guild = member.guild
+    trackers = invite_tracker.get(guild.id, {})
+    if not trackers:
+        return
+    for inviter_id in list(trackers.keys()):
+        if invite_tracker[guild.id].get(inviter_id, 0) > 0:
+            invite_tracker[guild.id][inviter_id] -= 1
+            if invite_tracker[guild.id][inviter_id] < 5:
+                role = guild.get_role(FREE_GEN_ROLE_ID)
+                user = guild.get_member(inviter_id)
+                if role and user and role in user.roles:
+                    try:
+                        await user.remove_roles(role)
+                    except Exception:
+                        pass
+            break
+
 # ---------------- on_ready: one-time HTTP clears + sync ----------------
 @bot.event
 async def on_ready():
-    # best-effort invites cache (not used)
+    # populate invites cache
     for g in bot.guilds:
         try:
-            _ = await g.invites()
+            invites_cache[g.id] = await g.invites()
         except Exception:
-            pass
+            invites_cache[g.id] = []
 
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
 
+    # start background loops safely
     if not boost_loop.is_running():
         boost_loop.start()
 
-    # One-time guild clear via HTTP
+    # --- ONE-TIME: clear guild commands via HTTP (safe for mobile) ---
     try:
         if not os.path.exists(_CLEARED_MARKER):
-            TOKEN = os.getenv("TOKEN")
+            TOKEN = os.getenv(TOKEN_ENV_NAME)
             APP_ID = APPLICATION_ID
             if not TOKEN:
                 print("[CLEAR ERROR] TOKEN env var not set; cannot clear commands automatically.")
@@ -563,10 +762,10 @@ async def on_ready():
     except Exception as e:
         print(f"[CLEAR ERROR] unexpected: {e}")
 
-    # One-time global clear
+    # --- ONE-TIME: clear GLOBAL commands via HTTP if needed ---
     try:
         if not os.path.exists(_CLEARED_GLOBAL_MARKER):
-            TOKEN = os.getenv("TOKEN")
+            TOKEN = os.getenv(TOKEN_ENV_NAME)
             APP_ID = APPLICATION_ID
             if not TOKEN:
                 print("[GLOBAL CLEAR ERROR] TOKEN env var not set; cannot clear global commands automatically.")
@@ -595,7 +794,7 @@ async def on_ready():
     except Exception as e:
         print(f"[GLOBAL CLEAR ERROR] unexpected: {e}")
 
-    # Sync commands to the guild
+    # --- SYNC commands to the guild (safe sync) ---
     try:
         guild = bot.get_guild(GUILD_ID)
         if guild is None:
@@ -609,6 +808,7 @@ async def on_ready():
     except Exception as e:
         print(f"[SYNC ERROR] unexpected: {e}")
 
+    # Optional one-time global sync (only if SYNC_ON_START true)
     if SYNC_ON_START:
         try:
             all_synced = await tree.sync()
@@ -616,147 +816,29 @@ async def on_ready():
         except Exception as e:
             print(f"[SYNC_ON_START ERROR] {e}")
 
-# ---------------- on_message: handle !freegenrole, vouches, and auto-delete channels ----------------
+# ---------------- on_message: auto-delete plain user messages in certain channels ----------------
 @bot.event
 async def on_message(message: discord.Message):
-    # ignore bots & webhooks
-    if message.author.bot:
+    if message.author.bot or message.webhook_id or message.type != discord.MessageType.default:
         await bot.process_commands(message)
         return
-
-    # VOUCH CHANNEL HANDLING (only relevant when REQUIRE_VOUCH_FOR_FREEGEN=True)
-    if message.channel.id == VOUCH_CHANNEL_ID:
-        if message.author.id in VOUCH_REQUIRED_USERS:
-            content = (message.content or "").lower()
-            if "vouch" in content:
-                mentioned_ids = {m.id for m in message.mentions}
-                if mentioned_ids:
-                    for target_id in mentioned_ids:
-                        if target_id in pending_vouches:
-                            pend = pending_vouches[target_id]
-                            vouchers: Set[int] = pend.get("vouchers", set())
-                            if message.author.id not in vouchers:
-                                vouchers.add(message.author.id)
-                                pend["vouchers"] = vouchers
-                                try:
-                                    await message.author.send(f"✅ Vouch recorded for <@{target_id}>. Thank you.")
-                                except Exception:
-                                    pass
-                                if VOUCH_REQUIRED_USERS.issubset(vouchers):
-                                    task = pend.get("task")
-                                    if task and not task.cancelled():
-                                        task.cancel()
-                                    pending_vouches.pop(target_id, None)
-                                    guild = bot.get_guild(GUILD_ID)
-                                    if guild:
-                                        member = guild.get_member(target_id)
-                                        if member:
-                                            try:
-                                                await member.send(
-                                                    ("🎉 Vouch successful — both staff members have vouched for you.\n\n"
-                                                     "You retain the Free Gen role. Enjoy the generator!")
-                                                )
-                                            except Exception:
-                                                pass
-        await bot.process_commands(message)
-        return
-
-    # TEXT COMMAND: !freegenrole (plain text; auto-deleted)
-    if message.content and message.content.strip().lower() == "!freegenrole":
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
-        user_id = message.author.id
-        guild = bot.get_guild(GUILD_ID)
-        member = None
-        if guild:
-            member = guild.get_member(user_id)
-
-        # Already have role?
-        if member and any(r.id == FREE_GEN_ROLE_ID for r in member.roles):
-            try:
-                await message.author.send("ℹ️ You already have the Free Gen role. Enjoy the generator!")
-            except Exception:
-                pass
-            return
-
-        # If we do NOT require vouch, grant immediately and DM simple message
-        if not REQUIRE_VOUCH_FOR_FREEGEN:
-            granted = False
-            if guild and member:
-                role = guild.get_role(FREE_GEN_ROLE_ID)
-                if role:
-                    try:
-                        await member.add_roles(role)
-                        granted = True
-                    except Exception:
-                        granted = False
-            try:
-                if granted:
-                    await message.author.send("🎉 You have been granted Free Gen access. Enjoy the generator! If you lose access for any reason, contact staff.")
-                else:
-                    await message.author.send("⚠️ We couldn't grant the Free Gen role automatically. Please contact staff.")
-            except Exception:
-                pass
-            return
-
-        # ELSE: REQUIRE_VOUCH_FOR_FREEGEN == True — old flow: grant role, start 5-minute pending vouch
-        if user_id in pending_vouches:
-            try:
-                await message.author.send("ℹ️ You already requested FreeGen. Please wait for staff vouches in the vouch channel.")
-            except Exception:
-                pass
-            return
-
-        granted = False
-        if guild and member:
-            role = guild.get_role(FREE_GEN_ROLE_ID)
-            if role:
-                try:
-                    await member.add_roles(role)
-                    granted = True
-                except Exception:
-                    granted = False
-
-        pending = {"expires": now_ts() + VOUCH_TIMEOUT_SECONDS, "vouchers": set()}
-        pending["task"] = _make_vouch_task(user_id)
-        pending_vouches[user_id] = pending
-
-        try:
-            await message.author.send(
-                (f"🎉 You have unlocked Free Gen! You now have the FreeGen role.\n\n"
-                 f"Next: To keep this role, both staff members must vouch for you within {VOUCH_TIMEOUT_SECONDS//60} minutes.\n"
-                 f"Please ask staff to vouch in <#{VOUCH_CHANNEL_ID}> by posting **vouch** and mentioning you.\n\n"
-                 "If both staff vouch within the time window, you'll receive a confirmation DM and keep the role. "
-                 "If they don't, the role will be removed and you'll receive a DM with instructions to appeal.")
-            )
-        except Exception:
-            pass
-        return
-
-    # If message starts with '/' assume slash invocation
     if message.content and message.content.startswith("/"):
         await bot.process_commands(message)
         return
-
-    # Auto-delete plain messages in configured channels
     if message.channel.id in AUTODELETE_CHANNELS:
         try:
             await message.delete()
         except Exception:
             pass
         return
-
     await bot.process_commands(message)
 
-# ---------------- RUN ----------------
+# ---------------- run ----------------
 if __name__ == "__main__":
-    TOKEN = os.getenv("TOKEN")
+    TOKEN = os.getenv(TOKEN_ENV_NAME)
     if not TOKEN:
         print("[ERROR] TOKEN env var not set. Please set TOKEN in Railway or your host.")
     else:
-        _ensure_stock_file()
-        stock_data = _load_stock_from_disk()
+        stock_data = _load_json(STOCK_FILE)
+        vouch_data = _load_json(VOUCH_FILE)
         bot.run(TOKEN)
