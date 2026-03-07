@@ -59,7 +59,7 @@ GUILD_OBJ = discord.Object(id=GUILD_ID)
 _file_lock = asyncio.Lock()
 
 def _ensure_stock_file():
-    # maintain backwards compatibility: original file may have 'categories' as list.
+    # create with category_emojis for backward compatibility
     if not os.path.exists(STOCK_FILE):
         with open(STOCK_FILE, "w", encoding="utf-8") as f:
             json.dump({"FREE": {}, "EXCLUSIVE": {}, "categories": [], "category_emojis": {}}, f, indent=4)
@@ -68,7 +68,7 @@ def _load_stock_from_disk() -> Dict:
     _ensure_stock_file()
     with open(STOCK_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-    # ensure keys exist for compatibility
+    # ensure keys exist
     if "FREE" not in data:
         data["FREE"] = {}
     if "EXCLUSIVE" not in data:
@@ -121,34 +121,7 @@ def is_admin_check():
         return any(r.id == ADMIN_ROLE_ID for r in getattr(user, "roles", []))
     return app_commands.check(predicate)
 
-# ---------------- autocomplete helpers ----------------
-async def category_autocomplete(interaction: discord.Interaction, current: str):
-    """
-    Autocomplete returns choices where the visible name includes the stored emoji (if any).
-    Value remains the raw category name so downstream commands receive the canonical category.
-    """
-    await safe_load_stock()
-    cats = stock_data.get("categories", [])
-    emojis = stock_data.get("category_emojis", {}) or {}
-    choices = []
-    cur = (current or "").lower()
-    for c in cats:
-        if cur and cur not in c.lower():
-            continue
-        emoji = emojis.get(c, "")
-        name = f"{emoji} {c}" if emoji else c
-        # ensure name not longer than 100
-        choices.append(app_commands.Choice(name=name[:100], value=c))
-        if len(choices) >= 25:
-            break
-    return choices
-
-async def stock_type_autocomplete(interaction: discord.Interaction, current: str):
-    opts = ["free", "exclusive"]
-    return [app_commands.Choice(name=o.capitalize(), value=o) for o in opts if current.lower() in o.lower()][:25]
-
 # ---------------- formatting & parsing ----------------
-
 def parse_items_from_text(text: str) -> List[str]:
     """
     Normalize provided text into a list of items.
@@ -157,11 +130,14 @@ def parse_items_from_text(text: str) -> List[str]:
     """
     if not text:
         return []
-    # replace CRLF with LF, split on newlines
-    lines = []
-    for raw_line in text.replace("\r\n", "\n").split("\n"):
-        # support comma-separated in a single line
-        if "," in raw_line and len(raw_line.strip()) > 0:
+    # unify line endings
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines: List[str] = []
+    for raw_line in text.split("\n"):
+        if not raw_line:
+            continue
+        # if comma-separated in a single line, split
+        if "," in raw_line and len(raw_line.strip()) > 0 and "\n" not in raw_line:
             for part in raw_line.split(","):
                 s = part.strip()
                 if s:
@@ -170,7 +146,7 @@ def parse_items_from_text(text: str) -> List[str]:
             s = raw_line.strip()
             if s:
                 lines.append(s)
-    # de-duplicate preserving order
+    # dedupe preserving order
     seen = set()
     out = []
     for l in lines:
@@ -188,7 +164,6 @@ def format_stock_embed():
       - Free categories (only keys present in stock_data['FREE'])
       - Exclusive categories (only keys present in stock_data['EXCLUSIVE'])
       - Unassigned categories (present in master 'categories' but not in either type)
-    Shows custom emoji in front of categories when available.
     """
     d = stock_data or {}
     free_map = d.get("FREE", {}) or {}
@@ -313,17 +288,40 @@ async def boost_loop():
         except Exception:
             continue
 
+# ---------------- autocomplete helpers ----------------
+async def category_autocomplete(interaction: discord.Interaction, current: str):
+    """
+    Autocomplete returns choices where the visible name includes the stored emoji (if any).
+    Value remains the raw category name so downstream commands receive the canonical category.
+    """
+    await safe_load_stock()
+    cats = stock_data.get("categories", [])
+    emojis = stock_data.get("category_emojis", {}) or {}
+    choices = []
+    cur = (current or "").lower()
+    for c in cats:
+        if cur and cur not in c.lower():
+            continue
+        emoji = emojis.get(c, "")
+        name = f"{emoji} {c}" if emoji else c
+        choices.append(app_commands.Choice(name=name[:100], value=c))
+        if len(choices) >= 25:
+            break
+    return choices
+
+async def stock_type_autocomplete(interaction: discord.Interaction, current: str):
+    opts = ["free", "exclusive"]
+    return [app_commands.Choice(name=o.capitalize(), value=o) for o in opts if current.lower() in o.lower()][:25]
+
 # ---------------- Gen UI ----------------
 class GenSelect(discord.ui.Select):
     def __init__(self, typ: str):
         opts = []
-        # ensure categories exist
         for cat in stock_data.get("categories", []):
             cnt = len(stock_data.get(typ, {}).get(cat, []))
             emoji = get_category_emoji(cat) or ""
             display = f"{emoji} {cat}" if emoji else cat
             label = f"{display} — {cnt}"
-            # label must be max 100
             opts.append(discord.SelectOption(label=label[:100], value=cat, description=f"{cnt} in stock" if cnt else "Out of stock"))
         super().__init__(placeholder="Choose a category", min_values=1, max_values=1, options=opts[:25])
         self.typ = typ
@@ -433,10 +431,6 @@ async def cmd_stock(interaction: discord.Interaction):
     app_commands.Choice(name="Both", value="both"),
 ])
 async def cmd_addcategory(interaction: discord.Interaction, category: str, scope: app_commands.Choice[str], emoji: Optional[str] = None):
-    """
-    Add a category and optionally set an emoji string for it.
-    Emoji is stored as-is and displayed in UIs and restock pings.
-    """
     await interaction.response.defer(ephemeral=True)
     await safe_load_stock()
     category = category.strip()
@@ -466,7 +460,6 @@ async def cmd_addcategory(interaction: discord.Interaction, category: str, scope
 
     # set optional emoji
     if emoji:
-        # store the emoji string (whatever admin provided). This may be <:name:id> or <a:name:id> or plain text like :Xbox:
         stock_data.setdefault("category_emojis", {})[category] = emoji.strip()
         responses.append(f"Set emoji for `{category}` to `{emoji.strip()}`.")
 
@@ -481,10 +474,6 @@ async def cmd_addcategory(interaction: discord.Interaction, category: str, scope
     app_commands.Choice(name="Both", value="both"),
 ])
 async def cmd_removecategory(interaction: discord.Interaction, category: str, scope: app_commands.Choice[str], remove_emoji: Optional[bool] = False):
-    """
-    If remove_emoji is True, the stored emoji for the category will be removed.
-    If scope == Both, category is removed from master list as well.
-    """
     await interaction.response.defer(ephemeral=True)
     await safe_load_stock()
     category = category.strip()
@@ -520,14 +509,10 @@ async def cmd_removecategory(interaction: discord.Interaction, category: str, sc
     await interaction.followup.send("✅ " + " ".join(msgs), ephemeral=True)
 
 # ---------------- set / get category emoji ----------------
-@tree.command(name="setcategoryemoji", description="Set (or remove) a custom emoji for a category (Admin only). Opens a confirm UI.", guild=GUILD_OBJ)
+@tree.command(name="setcategoryemoji", description="Set (or remove) a custom emoji for a category (Admin only).", guild=GUILD_OBJ)
 @is_admin_check()
 @app_commands.autocomplete(category=category_autocomplete)
 async def cmd_setcategoryemoji(interaction: discord.Interaction, category: str, emoji: Optional[str] = None):
-    """
-    Set or update the stored emoji for a category. If emoji is omitted, a confirm UI will allow removing the emoji.
-    The emoji string is stored as-is (e.g. <:name:id>, <a:name:id>, :Xbox:, or Unicode emoji).
-    """
     await interaction.response.defer(ephemeral=True)
     await safe_load_stock()
     if category not in stock_data.get("categories", []):
@@ -540,7 +525,7 @@ async def cmd_setcategoryemoji(interaction: discord.Interaction, category: str, 
     preview_embed = discord.Embed(title="🎯 Set Category Emoji", color=discord.Color.blurple())
     preview_embed.add_field(name="Category", value=f"`{category}`", inline=False)
     preview_embed.add_field(name="Current emoji", value=current or "(none)", inline=True)
-    preview_embed.add_field(name="New emoji", value=new_emoji or "(will remove emoji)" , inline=True)
+    preview_embed.add_field(name="New emoji", value=new_emoji or "(will remove emoji)", inline=True)
     preview_embed.set_footer(text="Confirm to apply the change.")
 
     class EmojiConfirmView(discord.ui.View):
@@ -594,7 +579,8 @@ class CategorySelect(discord.ui.Select):
         for c in stock_data.get("categories", []):
             emoji = get_category_emoji(c) or ""
             label = f"{emoji} {c}" if emoji else c
-            options.append(discord.SelectOption(label=label[:100], value=c, description=f"{len(stock_data.get('FREE', {}).get(c, []))} / {len(stock_data.get('EXCLUSIVE', {}).get(c, []))} items"))
+            desc = f"Free: {len(stock_data.get('FREE', {}).get(c, []))} • Excl: {len(stock_data.get('EXCLUSIVE', {}).get(c, []))}"
+            options.append(discord.SelectOption(label=label[:100], value=c, description=desc[:100]))
         super().__init__(placeholder="Select a category to manage", min_values=1, max_values=1, options=options[:25])
 
     async def callback(self, interaction: discord.Interaction):
@@ -624,7 +610,6 @@ class CategorySelect(discord.ui.Select):
 
             @discord.ui.button(label="Set Emoji", style=discord.ButtonStyle.primary)
             async def set_emoji(self, button: discord.ui.Button, inter: discord.Interaction):
-                # open modal to input emoji
                 class EmojiModal(discord.ui.Modal, title=f"Set emoji for {self.category_name}"):
                     emoji_input = discord.ui.TextInput(label="Emoji", placeholder="e.g. <:xbox:123> or :Xbox: or 🎮", required=True, max_length=100)
                     async def on_submit(self, modal_inter: discord.Interaction):
@@ -680,10 +665,6 @@ async def cmd_addstock(
     items: Optional[str] = None,
     file: Optional[discord.Attachment] = None
 ):
-    """
-    Add stock items to an existing category.
-    Fixed bug: parse_items_from_text is now implemented and duplicates are avoided.
-    """
     await interaction.response.defer(ephemeral=True)
     t = stock_type.lower()
     if t not in ("free", "exclusive"):
@@ -780,7 +761,7 @@ async def cmd_removestock(
     await safe_save_stock()
     await interaction.followup.send(f"✅ Removed {removed} item(s) from `{category}`.", ephemeral=True)
 
-@tree.command(name="restock", description="Replace stock (Admin only). Provide items or attach .txt — preview & confirm (10/10 UI)", guild=GUILD_OBJ)
+@tree.command(name="restock", description="Replace stock (Admin only). Provide items or attach .txt — preview & confirm", guild=GUILD_OBJ)
 @is_admin_check()
 @app_commands.autocomplete(stock_type=stock_type_autocomplete, category=category_autocomplete)
 async def cmd_restock(
@@ -790,13 +771,6 @@ async def cmd_restock(
     items: Optional[str] = None,
     file: Optional[discord.Attachment] = None
 ):
-    """
-    Enhanced restock command:
-      - parses items (file or text)
-      - shows a preview embed with first N sample items, total count
-      - requires the invoking admin to Confirm or Cancel
-      - on Confirm, replaces stock and announces to restock channel with emoji included
-    """
     await interaction.response.defer(ephemeral=True)
     t = stock_type.lower()
     if t not in ("free", "exclusive"):
@@ -825,7 +799,7 @@ async def cmd_restock(
         await interaction.followup.send("❌ Provide items or attach a .txt file.", ephemeral=True)
         return
 
-    # Build preview embed (10/10 restock UI)
+    # Build preview embed
     preview_embed = discord.Embed(
         title="🔁 Restock Preview",
         description=f"You're about to fully replace `{category}` in **{key}** with {len(new_items)} item(s).",
@@ -836,9 +810,8 @@ async def cmd_restock(
         preview_embed.add_field(name="Sample Items (first 10)", value="\n".join(f"`{s}`" for s in sample), inline=False)
     else:
         preview_embed.add_field(name="Sample Items", value="(no items)", inline=False)
-
     preview_embed.set_footer(text="Click CONFIRM to replace the inventory — this action will overwrite existing stock for the category.")
-    # Create Confirm / Cancel view
+
     class RestockConfirmView(discord.ui.View):
         def __init__(self, author_id: int, timeout: int = 300):
             super().__init__(timeout=timeout)
@@ -853,7 +826,6 @@ async def cmd_restock(
 
         @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
         async def confirm(self, button: discord.ui.Button, inter: discord.Interaction):
-            # apply restock
             try:
                 stock_data.setdefault(key, {})[category] = new_items
                 await safe_save_stock()
@@ -967,7 +939,7 @@ async def on_ready():
 
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
 
-    # One-time guild clear via HTTP (best-effort)
+    # One-time guild clear via HTTP (best-effort) - keeps original behaviour
     try:
         if not os.path.exists(_CLEARED_MARKER):
             TOKEN = os.getenv("TOKEN")
@@ -994,7 +966,7 @@ async def on_ready():
     except Exception as e:
         print(f"[CLEAR ERROR] unexpected: {e}")
 
-    # Sync to guild (scoped)
+    # Sync to guild (scoped) - robust & prints results so you can see registration
     try:
         guild = bot.get_guild(GUILD_ID)
         if guild is None:
