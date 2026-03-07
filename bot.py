@@ -1,4 +1,4 @@
-# bot.py — Generator + stock + invite + vouch-on-generate (vouch only triggers after /gen)
+# bot.py — Generator + stock + invite + no-vouch + emoji + restock UI + boost fix + auto-remove exclusive
 # Requirements (requirements.txt): discord.py, aiohttp
 # Env: set TOKEN to your bot token in Railway env vars.
 
@@ -26,12 +26,10 @@ RESTOCK_CHANNEL_ID = 1478792670049599618
 
 AUTODELETE_CHANNELS = {1478790217971273788, 1454503001363583019}
 
-# VOUCH configuration — staff who are required to vouch (both must vouch)
-VOUCH_REQUIRED_USERS = {884084052854984726, 1469703951166210223}  # update to your staff IDs
-VOUCH_CHANNEL_ID = 1452868333383716915
-VOUCH_TIMEOUT_SECONDS = 60 * 5  # 5 minutes
+# NOTE: vouch system removed per request
 
 STOCK_FILE = "stock.json"
+ASSIGNED_FILE = "assigned_roles.json"  # stores which users were auto-assigned exclusive by the bot
 
 FREE_COOLDOWN = 180
 EXCL_COOLDOWN = 60
@@ -47,7 +45,7 @@ intents.members = True
 intents.message_content = True
 intents.presences = True
 
-# Ensure application_id is provided to commands system
+# Provide application_id for stable command registration
 _app_id_int = int(APPLICATION_ID) if APPLICATION_ID and APPLICATION_ID.isdigit() else None
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None, application_id=_app_id_int)
 tree = bot.tree
@@ -55,6 +53,7 @@ GUILD_OBJ = discord.Object(id=GUILD_ID)
 
 # ---------------- storage & locks ----------------
 _file_lock = asyncio.Lock()
+_assigned_lock = asyncio.Lock()
 
 def _ensure_stock_file():
     if not os.path.exists(STOCK_FILE):
@@ -65,7 +64,7 @@ def _load_stock_from_disk() -> Dict:
     _ensure_stock_file()
     with open(STOCK_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-    # backward-compat keys
+    # ensure keys exist
     if "FREE" not in data: data["FREE"] = {}
     if "EXCLUSIVE" not in data: data["EXCLUSIVE"] = {}
     if "categories" not in data: data["categories"] = []
@@ -76,7 +75,22 @@ def _save_stock_to_disk(data: Dict):
     with open(STOCK_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
+def _ensure_assigned_file():
+    if not os.path.exists(ASSIGNED_FILE):
+        with open(ASSIGNED_FILE, "w", encoding="utf-8") as f:
+            json.dump({}, f, indent=4)
+
+def _load_assigned_from_disk() -> Dict:
+    _ensure_assigned_file()
+    with open(ASSIGNED_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def _save_assigned_to_disk(data: Dict):
+    with open(ASSIGNED_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
 stock_data = _load_stock_from_disk()
+assigned_data = _load_assigned_from_disk()  # maps str(user_id) -> {"exclusive_assigned": True/False, "boost_assigned": True/False}
 
 async def safe_load_stock():
     global stock_data
@@ -87,6 +101,45 @@ async def safe_load_stock():
 async def safe_save_stock():
     async with _file_lock:
         _save_stock_to_disk(stock_data)
+
+async def load_assigned():
+    global assigned_data
+    async with _assigned_lock:
+        assigned_data = _load_assigned_from_disk()
+        return assigned_data
+
+async def save_assigned():
+    async with _assigned_lock:
+        _save_assigned_to_disk(assigned_data)
+
+def mark_exclusive_assigned(user_id: int):
+    assigned_data[str(user_id)] = assigned_data.get(str(user_id), {})
+    assigned_data[str(user_id)]['exclusive_assigned'] = True
+
+def unmark_exclusive_assigned(user_id: int):
+    rec = assigned_data.get(str(user_id))
+    if rec and 'exclusive_assigned' in rec:
+        rec.pop('exclusive_assigned', None)
+    # remove entry if empty
+    if rec and not rec:
+        assigned_data.pop(str(user_id), None)
+
+def is_exclusive_assigned(user_id: int) -> bool:
+    return bool(assigned_data.get(str(user_id), {}).get('exclusive_assigned', False))
+
+def mark_boost_assigned(user_id: int):
+    assigned_data[str(user_id)] = assigned_data.get(str(user_id), {})
+    assigned_data[str(user_id)]['boost_assigned'] = True
+
+def unmark_boost_assigned(user_id: int):
+    rec = assigned_data.get(str(user_id))
+    if rec and 'boost_assigned' in rec:
+        rec.pop('boost_assigned', None)
+    if rec and not rec:
+        assigned_data.pop(str(user_id), None)
+
+def is_boost_assigned(user_id: int) -> bool:
+    return bool(assigned_data.get(str(user_id), {}).get('boost_assigned', False))
 
 # ---------------- util / cooldowns ----------------
 _cooldowns: Dict = {}
@@ -121,6 +174,7 @@ def parse_items_from_text(text: str) -> List[str]:
     for raw_line in text.split("\n"):
         if not raw_line:
             continue
+        # support comma-separated lists inside a line
         if "," in raw_line and len(raw_line.strip()) > 0:
             for part in raw_line.split(","):
                 s = part.strip()
@@ -128,6 +182,7 @@ def parse_items_from_text(text: str) -> List[str]:
         else:
             s = raw_line.strip()
             if s: lines.append(s)
+    # dedupe preserving order
     seen = set()
     out = []
     for l in lines:
@@ -180,73 +235,68 @@ def format_stock_embed():
     embed.set_footer(text="Automated • Marcos Gen")
     return embed
 
-# ---------------- vouch pending ----------------
-pending_vouches: Dict[int, Dict] = {}
-
-def _make_vouch_task(target_id: int):
-    async def waiter():
-        try:
-            await asyncio.sleep(VOUCH_TIMEOUT_SECONDS)
-            await _expire_vouch_request(target_id)
-        except asyncio.CancelledError:
-            return
-    return asyncio.create_task(waiter())
-
-async def _expire_vouch_request(target_id: int):
-    pending = pending_vouches.get(target_id)
-    if not pending: return
-    vouchers = pending.get("vouchers", set())
+# ---------------- boost loop (auto assign + auto-remove) ----------------
+@tasks.loop(minutes=5)
+async def boost_loop():
+    # Load assigned_data fresh
+    await load_assigned()
     guild = bot.get_guild(GUILD_ID)
-    if len(vouchers) < len(VOUCH_REQUIRED_USERS):
-        if guild:
-            try:
-                member = guild.get_member(target_id) or await guild.fetch_member(target_id)
-            except Exception:
-                member = None
-            if member:
-                role = guild.get_role(FREE_GEN_ROLE_ID)
-                try:
-                    if role and role in member.roles:
-                        await member.remove_roles(role)
-                except Exception:
-                    pass
-                try:
-                    await member.send(
-                        ("⏳ Vouch failed — required staff vouches were not received in time.\n\n"
-                         "Your Free Gen role has been removed. To appeal, contact staff.")
-                    )
-                except Exception:
-                    pass
+    if not guild:
+        return
+
+    # Use guild.premium_subscription_count for total server boosts
+    try:
+        server_boosts = getattr(guild, "premium_subscription_count", None)
+        if server_boosts is None:
+            # fallback to attribute name variation
+            server_boosts = getattr(guild, "premium_tier", 0) or 0
+        server_boosts = int(server_boosts or 0)
+    except Exception:
+        server_boosts = 0
+
+    boost_role = guild.get_role(BOOST_ROLE_ID)
+    exclusive_role = guild.get_role(EXCLUSIVE_ROLE_ID)
+
+    for member in guild.members:
         try:
-            if guild:
-                vch = guild.get_channel(VOUCH_CHANNEL_ID)
-                if vch:
-                    msg = await vch.send(f"🔔 **VOUCH FAILED** for <@{target_id}> — received {len(vouchers)}/{len(VOUCH_REQUIRED_USERS)} vouches.")
+            is_boosting = bool(getattr(member, "premium_since", None))
+            # assign or remove boost role
+            if is_boosting:
+                if boost_role and boost_role not in member.roles:
                     try:
-                        await msg.create_thread(name=f"appeal-{target_id}-{int(now_ts())}")
+                        await member.add_roles(boost_role)
+                        mark_boost_assigned(member.id)
+                    except Exception:
+                        pass
+                # only auto-assign Exclusive role when server has at least 2 boosts
+                if server_boosts >= 2:
+                    if exclusive_role and exclusive_role not in member.roles:
+                        try:
+                            await member.add_roles(exclusive_role)
+                            mark_exclusive_assigned(member.id)
+                        except Exception:
+                            pass
+                # if server has <2 boosts, do not auto-assign exclusive (and do not remove if present)
+            else:
+                # not currently boosting -> remove boost role if bot assigned it
+                if boost_role and boost_role in member.roles and is_boost_assigned(member.id):
+                    try:
+                        await member.remove_roles(boost_role)
+                        unmark_boost_assigned(member.id)
+                    except Exception:
+                        pass
+                # if this user was auto-assigned Exclusive by the bot, remove it now
+                if exclusive_role and exclusive_role in member.roles and is_exclusive_assigned(member.id):
+                    try:
+                        await member.remove_roles(exclusive_role)
+                        unmark_exclusive_assigned(member.id)
                     except Exception:
                         pass
         except Exception:
-            pass
-    pending_vouches.pop(target_id, None)
-
-# ---------------- boost loop ----------------
-@tasks.loop(minutes=5)
-async def boost_loop():
-    guild = bot.get_guild(GUILD_ID)
-    if not guild: return
-    boost_role = guild.get_role(BOOST_ROLE_ID)
-    exclusive_role = guild.get_role(EXCLUSIVE_ROLE_ID)
-    for member in guild.members:
-        try:
-            if member.premium_since:
-                if boost_role and boost_role not in member.roles: await member.add_roles(boost_role)
-                if exclusive_role and exclusive_role not in member.roles: await member.add_roles(exclusive_role)
-            else:
-                if boost_role and boost_role in member.roles: await member.remove_roles(boost_role)
-                if exclusive_role and exclusive_role in member.roles: await member.remove_roles(exclusive_role)
-        except Exception:
             continue
+
+    # save assigned_data after loop
+    await save_assigned()
 
 # ---------------- autocomplete helpers ----------------
 async def category_autocomplete(interaction: discord.Interaction, current: str):
@@ -256,8 +306,7 @@ async def category_autocomplete(interaction: discord.Interaction, current: str):
     choices = []
     cur = (current or "").lower()
     for c in cats:
-        if cur and cur not in c.lower():
-            continue
+        if cur and cur not in c.lower(): continue
         emoji = emojis.get(c, "")
         name = f"{emoji} {c}" if emoji else c
         choices.append(app_commands.Choice(name=name[:100], value=c))
@@ -295,6 +344,7 @@ class GenSelect(discord.ui.Select):
         await safe_save_stock()
         set_cooldown(interaction.user.id, self.typ)
 
+        # send DM with item
         dm_ok = True
         try:
             await interaction.user.send(f"🎉 **Here is your item from {cat}:**\n```{item}```")
@@ -304,33 +354,8 @@ class GenSelect(discord.ui.Select):
         if dm_ok:
             await interaction.followup.send("✅ Sent to your DMs.", ephemeral=True)
         else:
-            await interaction.followup.send(
-                ("⚠️ Could not send DM. Enable DMs or accept direct messages.\n\n"
-                 f"Here is your item for now:\n```{item}```"), ephemeral=True)
-
-        if self.typ == "FREE":
-            target_id = interaction.user.id
-            if target_id not in pending_vouches:
-                pending = {"expires": now_ts() + VOUCH_TIMEOUT_SECONDS, "vouchers": set()}
-                pending["task"] = _make_vouch_task(target_id)
-                pending_vouches[target_id] = pending
-                try:
-                    await interaction.user.send(
-                        (f"🔔 **Vouch required** — Staff must vouch within {VOUCH_TIMEOUT_SECONDS//60} minutes. "
-                         f"Staff should go to <#{VOUCH_CHANNEL_ID}> and type `vouch` while mentioning you.")
-                    )
-                except Exception:
-                    pass
-                try:
-                    guild = bot.get_guild(GUILD_ID)
-                    if guild:
-                        vch = guild.get_channel(VOUCH_CHANNEL_ID)
-                        if vch:
-                            await vch.send(
-                                (f"🔔 **VOUCH REQUEST** — <@{target_id}> generated a FREE item and requires staff vouches.")
-                            )
-                except Exception:
-                    pass
+            await interaction.followup.send(("⚠️ Could not send DM. Enable DMs or accept direct messages.\n\n"
+                                            f"Here is your item for now:\n```{item}```"), ephemeral=True)
 
 class GenView(discord.ui.View):
     def __init__(self, typ: str):
@@ -396,7 +421,7 @@ async def cmd_addcategory(interaction: discord.Interaction, category: str, scope
 
     if emoji:
         stock_data.setdefault("category_emojis", {})[category] = emoji.strip()
-        responses.append(f"Set emoji for `{category}`.")
+        responses.append("Set emoji for category.")
 
     await safe_save_stock()
     await interaction.followup.send("✅ " + " ".join(responses), ephemeral=True)
@@ -606,13 +631,11 @@ async def cmd_addstock(interaction: discord.Interaction, stock_type: str, catego
         except Exception:
             await interaction.followup.send("❌ Could not read attached file.", ephemeral=True); return
         for line in lines:
-            if line not in exist_set and line not in new_items:
-                new_items.append(line)
+            if line not in exist_set and line not in new_items: new_items.append(line)
     elif items:
         lines = parse_items_from_text(items)
         for line in lines:
-            if line not in exist_set and line not in new_items:
-                new_items.append(line)
+            if line not in exist_set and line not in new_items: new_items.append(line)
     else:
         await interaction.followup.send("❌ Provide items in `items` or attach a .txt file.", ephemeral=True); return
 
@@ -620,13 +643,15 @@ async def cmd_addstock(interaction: discord.Interaction, stock_type: str, catego
     await safe_save_stock()
     await interaction.followup.send(f"✅ Added {len(new_items)} item(s) to `{category}`.", ephemeral=True)
 
+    # restock ping format:
+    # <@&role_id> 🔔 Category was restocked — N new items.
     try:
         restock_channel = bot.get_channel(RESTOCK_CHANNEL_ID) or (interaction.guild.get_channel(RESTOCK_CHANNEL_ID) if interaction.guild else None)
         role_id = FREE_GEN_ROLE_ID if key == "FREE" else EXCLUSIVE_ROLE_ID
         emoji = stock_data.get("category_emojis", {}).get(category, "")
+        prefix = f"{emoji} " if emoji else ""
         if restock_channel and new_items:
-            prefix = f"{emoji} " if emoji else ""
-            await restock_channel.send(f"{prefix}<@&{role_id}> 🔔 `{category}` was restocked ({len(new_items)} new item(s)).")
+            await restock_channel.send(f"{prefix}<@&{role_id}> 🔔 {category} was restocked — {len(new_items)} new items.")
     except Exception:
         pass
 
@@ -727,7 +752,7 @@ async def cmd_restock(interaction: discord.Interaction, stock_type: str, categor
                 emoji = stock_data.get("category_emojis", {}).get(category, "")
                 prefix = f"{emoji} " if emoji else ""
                 if restock_channel:
-                    await restock_channel.send(f"{prefix}<@&{role_id}> 🚀 `{category}` fully restocked with {len(new_items)} item(s).")
+                    await restock_channel.send(f"{prefix}<@&{role_id}> 🔔 {category} was restocked — {len(new_items)} new items.")
             except Exception:
                 pass
 
@@ -816,6 +841,9 @@ async def global_appcmd_error(interaction: discord.Interaction, error: app_comma
 # ---------------- on_ready ----------------
 @bot.event
 async def on_ready():
+    # ensure assigned data loaded
+    await load_assigned()
+
     try:
         if not boost_loop.is_running(): boost_loop.start()
     except Exception as e:
@@ -864,41 +892,7 @@ async def on_message(message: discord.Message):
     if message.author.bot or message.webhook_id or message.type != discord.MessageType.default:
         await bot.process_commands(message); return
 
-    if message.channel.id == VOUCH_CHANNEL_ID:
-        if message.author.id in VOUCH_REQUIRED_USERS:
-            content = (message.content or "").strip().lower()
-            if "vouch" in content:
-                mentioned_ids = {m.id for m in message.mentions}
-                if mentioned_ids:
-                    for target_id in mentioned_ids:
-                        if target_id in pending_vouches:
-                            pend = pending_vouches[target_id]
-                            vouchers: Set[int] = pend.get("vouchers", set())
-                            if message.author.id not in vouchers:
-                                vouchers.add(message.author.id)
-                                pend["vouchers"] = vouchers
-                                try:
-                                    await message.author.send(f"✅ Your vouch for <@{target_id}> has been recorded.")
-                                except Exception:
-                                    pass
-                                if VOUCH_REQUIRED_USERS.issubset(vouchers):
-                                    task = pend.get("task")
-                                    if task and not task.cancelled(): task.cancel()
-                                    pending_vouches.pop(target_id, None)
-                                    try:
-                                        await message.channel.send(f"✅ **Vouch successful** — <@{target_id}> keeps Free Gen access.")
-                                    except Exception:
-                                        pass
-                                    try:
-                                        guild = bot.get_guild(GUILD_ID)
-                                        if guild:
-                                            member = guild.get_member(target_id) or await guild.fetch_member(target_id)
-                                            if member:
-                                                await member.send("🎉 Vouch successful — you retain Free Gen access.")
-                                    except Exception:
-                                        pass
-        await bot.process_commands(message); return
-
+    # TEXT command: !freegenrole -> request FreeGen; immediate role grant
     if message.content and message.content.strip().lower() == "!freegenrole":
         try: await message.delete()
         except Exception: pass
@@ -949,5 +943,7 @@ if __name__ == "__main__":
         print("[ERROR] TOKEN env var not set. Set TOKEN in Railway env variables.")
     else:
         _ensure_stock_file()
+        _ensure_assigned_file()
         stock_data = _load_stock_from_disk()
+        assigned_data = _load_assigned_from_disk()
         bot.run(TOKEN)
