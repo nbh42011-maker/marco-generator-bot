@@ -122,31 +122,44 @@ async def stock_type_autocomplete(interaction: discord.Interaction, current: str
 
 # ---------------- formatting & parsing ----------------
 def format_stock_embed():
-    d = stock_data
+    """
+    Build a stock overview embed that strictly shows:
+      - Free categories (only keys present in stock_data['FREE'])
+      - Exclusive categories (only keys present in stock_data['EXCLUSIVE'])
+      - Unassigned categories (present in master 'categories' but not in either type)
+    """
+    d = stock_data or {}
+    free_map = d.get("FREE", {}) or {}
+    excl_map = d.get("EXCLUSIVE", {}) or {}
+    master = list(d.get("categories", []) or [])
+
+    # Sorted lists (stable display)
+    free_cats = sorted(free_map.keys())
+    excl_cats = sorted(excl_map.keys())
+
+    # Categories in master but not in either free/exclusive
+    assigned = set(free_cats) | set(excl_cats)
+    unassigned = [c for c in sorted(master) if c not in assigned]
+
     embed = discord.Embed(title="📦 Stock Overview", color=discord.Color.blue())
-    free_lines = []
-    excl_lines = []
-    for cat in d.get("categories", []):
-        free_lines.append(f"**{cat}** → {len(d.get('FREE', {}).get(cat, []))}")
-        excl_lines.append(f"**{cat}** → {len(d.get('EXCLUSIVE', {}).get(cat, []))}")
-    embed.add_field(name="🆓 Free Stock", value="\n".join(free_lines) or "No categories", inline=False)
-    embed.add_field(name="💎 Exclusive Stock", value="\n".join(excl_lines) or "No categories", inline=False)
-    embed.set_footer(text="Professional • Secure • Automated")
-    return embed
 
-def parse_items_from_text(text: str) -> List[str]:
-    if not text:
-        return []
-    text = text.strip()
-    # prefer newline-splitting, fall back to commas, else single item
-    if "\n" in text:
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-    elif "," in text:
-        lines = [l.strip() for l in text.split(",") if l.strip()]
+    if free_cats:
+        free_lines = [f"**{cat}** → {len(free_map.get(cat, []))}" for cat in free_cats]
+        embed.add_field(name="🆓 Free Stock", value="\n".join(free_lines), inline=False)
     else:
-        lines = [text]
-    return lines
+        embed.add_field(name="🆓 Free Stock", value="No Free categories", inline=False)
 
+    if excl_cats:
+        excl_lines = [f"**{cat}** → {len(excl_map.get(cat, []))}" for cat in excl_cats]
+        embed.add_field(name="💎 Exclusive Stock", value="\n".join(excl_lines), inline=False)
+    else:
+        embed.add_field(name="💎 Exclusive Stock", value="No Exclusive categories", inline=False)
+
+    if unassigned:
+        embed.add_field(name="⚠️ Unassigned Categories", value=", ".join(unassigned), inline=False)
+
+    embed.set_footer(text="Automated • Marcos Gen")
+    return embed
 # ---------------- vouch pending state (only created on generate) ----------------
 # { target_user_id: {"expires": ts, "vouchers": set(ids), "task": asyncio.Task} }
 pending_vouches: Dict[int, Dict] = {}
