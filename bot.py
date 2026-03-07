@@ -13,23 +13,21 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-# ---------------- CONFIG (change IDs if needed) ----------------
-GUILD_ID = 1452717489656954961          # Your server ID
-APPLICATION_ID = "1478522023696273428"  # Client/App ID string
-TOKEN_ENV_NAME = "TOKEN"                # env var name
+# ---------------- CONFIG (edit IDs if needed) ----------------
+GUILD_ID = 1452717489656954961          # Your server ID (must be exact)
+APPLICATION_ID = "1478522023696273428"  # Bot application (client) ID as string
+TOKEN_ENV_NAME = "TOKEN"                # env var name for token
 
-FREE_GEN_ROLE_ID = 1467913996723032315  # FreeGen role
-EXCLUSIVE_ROLE_ID = 1453906576237924603
+FREE_GEN_ROLE_ID = 1467913996723032315  # FreeGen role ID
+EXCLUSIVE_ROLE_ID = 1453906576237924603 # Exclusive role ID
 BOOST_ROLE_ID = 1453187878061478019
 ADMIN_ROLE_ID = 1452719764119093388
 STAFF_NOTIFY_USER_ID = 884084052854984726
 
 RESTOCK_CHANNEL_ID = 1478792670049599618  # channel for restock pings
+VOUCH_CHANNEL_ID = 1452868333383716915    # vouch posts go here (you provided this)
 
-# <-- VOUCH CHANNEL UPDATED TO THE ID YOU GAVE
-VOUCH_CHANNEL_ID = 1452868333383716915    # vouch posts go here
-
-# Channels where plain user messages should be auto-deleted
+# Channels where plain user messages should be auto-deleted (no response)
 AUTODELETE_CHANNELS = {1478790217971273788, 1454503001363583019}
 
 STOCK_FILE = "stock.json"
@@ -56,7 +54,7 @@ intents.presences = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 tree = bot.tree
 
-# ---------------- storage & lock ----------------
+# ---------------- storage & locks ----------------
 _file_lock = asyncio.Lock()
 _vouch_lock = asyncio.Lock()
 
@@ -77,7 +75,7 @@ def _save_json(path: str, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
-# ensure files exist
+# ensure data files exist
 _ensure_file(STOCK_FILE, {"FREE": {}, "EXCLUSIVE": {}, "categories": []})
 _ensure_file(VOUCH_FILE, {"vouches": []})
 
@@ -125,6 +123,8 @@ def set_cooldown(user_id: int, typ: str):
 def is_admin_check():
     async def predicate(interaction: discord.Interaction) -> bool:
         user = interaction.user
+        if not hasattr(user, "roles"):
+            return False
         return any(r.id == ADMIN_ROLE_ID for r in getattr(user, "roles", []))
     return app_commands.check(predicate)
 
@@ -154,6 +154,13 @@ def format_stock_embed():
 
 # ---------------- parsing helper (preserves ':') ----------------
 def parse_items_from_text(text: str) -> List[str]:
+    """
+    Parse input text into list of items.
+    - If text contains newlines -> split on newlines (preferred)
+    - Else if contains commas -> split on commas
+    - Else -> single item
+    Keeps ':' characters intact.
+    """
     if not text:
         return []
     text = text.strip()
@@ -233,7 +240,7 @@ class GenSelect(discord.ui.Select):
                  f"Here is your item for now:\n```{item}```"),
                 ephemeral=True
             )
-        # staff log
+        # staff log (best-effort)
         try:
             staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
             await staff.send(f"[Generate] {interaction.user} ({interaction.user.id}) got item from {cat} ({self.typ})")
@@ -356,7 +363,6 @@ async def cmd_removecategory(interaction: discord.Interaction, category: str, sc
             removed_msgs.append("Removed from master categories list.")
 
     await safe_save_stock()
-
     reply = ("⚠️ Category not present in master list. " if warning else "") + " ".join(removed_msgs)
     await interaction.followup.send(f"✅ {reply}", ephemeral=True)
 
@@ -371,6 +377,10 @@ async def cmd_addstock(
     items: Optional[str] = None,
     file: Optional[discord.Attachment] = None
 ):
+    """
+    Use 'items' (paste multi-line or comma-separated list) OR attach a .txt file.
+    Parameter names must match decorator (stock_type, category).
+    """
     await interaction.response.defer(ephemeral=True)
     t = stock_type.lower()
     if t not in ("free", "exclusive"):
@@ -407,6 +417,7 @@ async def cmd_addstock(
     await safe_save_stock()
     await interaction.followup.send(f"✅ Added {len(new_items)} item(s) to `{category}`.", ephemeral=True)
 
+    # Ping restock channel (best-effort)
     restock_channel = bot.get_channel(RESTOCK_CHANNEL_ID) or (interaction.guild.get_channel(RESTOCK_CHANNEL_ID) if interaction.guild else None)
     role_id = FREE_GEN_ROLE_ID if key == "FREE" else EXCLUSIVE_ROLE_ID
     if restock_channel and new_items:
@@ -648,6 +659,7 @@ async def global_appcmd_error(interaction: discord.Interaction, error: app_comma
         except Exception:
             pass
         return
+    # fallback: notify staff and user
     print(f"[AppCommandError] {error!r}")
     try:
         if not interaction.response.is_done():
@@ -685,7 +697,7 @@ async def on_member_join(member: discord.Member):
         invite_tracker[guild.id].setdefault(inviter.id, 0)
         invite_tracker[guild.id][inviter.id] += 1
 
-        # Grant role at 5 invites
+        # Grant FreeGen role at 5 invites
         if invite_tracker[guild.id][inviter.id] >= 5:
             role = guild.get_role(FREE_GEN_ROLE_ID)
             user = guild.get_member(inviter.id)
@@ -801,6 +813,7 @@ async def on_ready():
             print(f"[SYNC ERROR] Guild {GUILD_ID} not present in bot.guilds. Skipping guild sync.")
         else:
             try:
+                # guild-sync via object (scoped sync — fast and avoids global rate limits)
                 synced = await tree.sync(guild=guild)
                 print(f"✅ Commands synced to guild ({len(synced)} commands).")
             except Exception as e:
@@ -839,6 +852,7 @@ if __name__ == "__main__":
     if not TOKEN:
         print("[ERROR] TOKEN env var not set. Please set TOKEN in Railway or your host.")
     else:
+        # reload data before starting
         stock_data = _load_json(STOCK_FILE)
         vouch_data = _load_json(VOUCH_FILE)
         bot.run(TOKEN)
